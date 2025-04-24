@@ -1,4 +1,4 @@
-DB_PATH = "/Users/kailenrichards/Desktop/beta_kilter/kiltergen/db.sqlite3"
+DB_PATH = "/Users/kailenrichards/Desktop/kiltergen/db.sqlite3"
 BEAM_WIDTH = 100
 X_SPACING = 18.66666666666
 MAX_HAND_REACH = 3.5 * X_SPACING
