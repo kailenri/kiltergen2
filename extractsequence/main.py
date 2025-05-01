@@ -3,7 +3,7 @@ import sqlite3
 import time
 from typing import List, Dict
 from tqdm.auto import tqdm
-from sequence_generator import ClimbSequenceGenerator
+from extractsequence.sequence_generator import ClimbSequenceGenerator
 from config import *
 import warnings
 
