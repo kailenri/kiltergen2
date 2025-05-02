@@ -11,7 +11,6 @@ from collections import defaultdict
 from lstm import AdaptedClimbGenerator, ClimbLSTM
 
 class ClimbCreator:
-    """Create new climbing routes with a trained model"""
     def __init__(self, model_path, data_file):
         """Initialize with a trained model and data file for hold layouts"""
         self.data_file = data_file
