@@ -8,7 +8,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from datetime import datetime
 from collections import defaultdict
-from climb_generator import AdaptedClimbGenerator, ClimbLSTM
+from lstm import AdaptedClimbGenerator, ClimbLSTM
 
 class ClimbCreator:
     """Create new climbing routes with a trained model"""

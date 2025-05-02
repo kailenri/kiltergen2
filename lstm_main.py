@@ -7,7 +7,7 @@ import random
 from datetime import datetime
 from pathlib import Path
 
-from climb_generator import AdaptedClimbGenerator
+from lstm import AdaptedClimbGenerator
 
 def setup_parser():
     """Set up command line argument parser"""
