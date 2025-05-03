@@ -14,17 +14,17 @@ class ClimbCreator:
     def __init__(self, model_path, data_file):
         self.data_file = data_file
         
-        # Load data for hold layouts
+        #get hold data
         print(f"Loading data from {data_file}")
         self.wall_layouts = self._load_wall_layouts(data_file)
         print(f"Loaded {len(self.wall_layouts)} wall layouts")
         
-        # Load generator to utilize its dataset
+        #load the generator 
         self.generator = ClimbGenerator(data_file)
         if not self.generator.load_model(model_path):
             print("Warning: Failed to load model. Some functionality may be limited.")
             
-        # Role mappings
+        #mapps the roles
         self.role_mapping = {
             12: 'Start',
             13: 'Hand',
@@ -43,24 +43,23 @@ class ClimbCreator:
             if 'best_sequence' not in climb:
                 continue
                 
-            # Get wall bounds
+            #bounds of the wall
             holds = climb['best_sequence'].get('holds', [])
             if not holds:
                 continue
                 
-            # Create a hash key based on the hold positions
+            # makes a hash key based on positions
             hold_positions = []
             for hold in holds:
                 if 'hole_id' in hold and 'x' in hold and 'y' in hold:
                     hold_positions.append((hold['hole_id'], hold['x'], hold['y']))
             
             if hold_positions:
-                # Sort to ensure same wall pattern with different hold IDs matches
                 sorted_positions = sorted(hold_positions, key=lambda h: (h[1], h[2]))
                 wall_key = '_'.join([f"{x}_{y}" for _, x, y in sorted_positions])
                 
                 if wall_key not in wall_layouts:
-                    # Create wall layout entry
+                    #make layouts for each climb
                     wall_layouts[wall_key] = {
                         'id': climb.get('id', f"wall_{len(wall_layouts)}"),
                         'name': climb.get('name', f"Wall Layout {len(wall_layouts) + 1}"),
@@ -106,81 +105,72 @@ class ClimbCreator:
     
     def create_climb(self, wall_index=None, difficulty='moderate', start_holds=None, finish_holds=None, 
                      min_moves=6, max_moves=15):
-        # Select a wall layout
+        #select "layout" all the same
         if wall_index is None:
-            # Pick a random layout
             layout_key = random.choice(list(self.wall_layouts.keys()))
             layout = self.wall_layouts[layout_key]
         else:
-            # Convert index to 0-based
             adj_index = max(0, min(wall_index - 1, len(self.wall_layouts) - 1))
             layout_key = list(self.wall_layouts.keys())[adj_index]
             layout = self.wall_layouts[layout_key]
         
         print(f"Creating new climb on wall layout: {layout['name']}")
         
-        # Select appropriate holds for start and finish
+        #find appropriate start and finish holds
         all_holds = layout['holds']
         wall_bounds = layout['bounds']
         
-        # Process holds by role
+        #Process holds by role
         holds_by_role = defaultdict(list)
         for hold in all_holds:
-            role_id = hold.get('role_id', 13)  # Default to hand
+            role_id = hold.get('role_id', 13) 
             holds_by_role[role_id].append(hold)
             
-        # Choose start holds - prefer lower on the wall
+        #get start holds
         if not start_holds:
-            # Sort holds by height (y-value)
+            #sort by height
             sorted_holds = sorted(all_holds, key=lambda h: h.get('y', 0))
             
-            # Take 2 holds from the lower third of the wall
+            #prefer lower holds for start
             lower_third = sorted_holds[:max(2, len(sorted_holds) // 3)]
-            
-            # If there are designated start holds, prefer those
             designated_starts = holds_by_role.get(12, [])
             if designated_starts:
                 start_candidates = designated_starts
             else:
                 start_candidates = lower_third
                 
-            # Select 2 start holds
+            #get 2 start holds
             if len(start_candidates) >= 2:
                 start_holds = random.sample(start_candidates, 2)
             else:
-                # Use all available and possibly duplicate
                 start_holds = start_candidates * 2 if start_candidates else sorted_holds[:2]
-                
-            # Mark them as start holds
             for hold in start_holds:
                 hold['role_id'] = 12
         
-        # Choose finish holds - prefer higher on the wall
+        #find a finish hold
         if not finish_holds:
-            # Sort holds by height (y-value), descending
+            #sort holds by height
             sorted_holds = sorted(all_holds, key=lambda h: h.get('y', 0), reverse=True)
             
-            # Take holds from the upper third of the wall
+            #get holds from upper part of the wall
             upper_third = sorted_holds[:max(1, len(sorted_holds) // 3)]
-            
-            # If there are designated finish holds, prefer those
+        
             designated_finishes = holds_by_role.get(14, [])
             if designated_finishes:
                 finish_candidates = designated_finishes
             else:
                 finish_candidates = upper_third
                 
-            # Select 1 finish hold
+            #find 1 finish hold
             if finish_candidates:
                 finish_holds = [random.choice(finish_candidates)]
             else:
                 finish_holds = [sorted_holds[0]] if sorted_holds else []
                 
-            # Mark it as a finish hold
             for hold in finish_holds:
                 hold['role_id'] = 14
         
-        # Select intermediate holds based on difficulty
+        #get intermediate holds based on difficulty
         difficulty_map = {
             'easy': {'hand_ratio': 0.2, 'foot_ratio': 0.3, 'max_distance': 30},
             'moderate': {'hand_ratio': 0.3, 'foot_ratio': 0.2, 'max_distance': 40},
@@ -189,34 +179,31 @@ class ClimbCreator:
         
         params = difficulty_map.get(difficulty, difficulty_map['moderate'])
         
-        # Select additional hand holds
+        #get additional hand holds
         available_holds = [h for h in all_holds 
                           if h not in start_holds and h not in finish_holds]
-        
-        # Determine how many hand and foot holds to use
         total_additional = min(len(available_holds), random.randint(min_moves, max_moves) - len(start_holds) - len(finish_holds))
         hand_count = max(2, int(total_additional * params['hand_ratio']))
         foot_count = max(1, int(total_additional * params['foot_ratio']))
-        
-        # Spread holds throughout the wall
+
         if available_holds:
-            # Sort by y-coordinate
+            #sort by y-coordinate
             sorted_by_y = sorted(available_holds, key=lambda h: h.get('y', 0))
             step_y = max(1, len(sorted_by_y) // (hand_count + 1))
             
             hand_holds = []
-            # Select hand holds with good spacing
+            #select hand holds with good spacing
             for i in range(hand_count):
                 index = min((i + 1) * step_y, len(sorted_by_y) - 1)
                 hold = sorted_by_y[index]
-                hold['role_id'] = 13  # Mark as hand hold
+                hold['role_id'] = 13  
                 hand_holds.append(hold)
             
-            # Select foot holds
+            #seldct foot holds
             remaining = [h for h in available_holds if h not in hand_holds]
             foot_holds = random.sample(remaining, min(foot_count, len(remaining)))
             for hold in foot_holds:
-                hold['role_id'] = 15  # Mark as foot hold
+                hold['role_id'] = 15  
         else:
             hand_holds = []
             foot_holds = []

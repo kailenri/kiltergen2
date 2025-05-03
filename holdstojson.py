@@ -40,14 +40,14 @@ def extract_holds_in(db_path, table_name, limit=0):
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
     
-    # Check if the table exists
+    #check if the table exists
     cursor.execute(f"SELECT name FROM sqlite_master WHERE type='table' AND name='{table_name}'")
     if not cursor.fetchone():
         print(f"Error: Table '{table_name}' not found in database")
         conn.close()
         return []
     
-    # Check if holds_in column exists
+    #check if holds_in column exists
     cursor.execute(f"PRAGMA table_info({table_name})")
     columns = [row['name'] for row in cursor.fetchall()]
     if 'holds_in' not in columns:
@@ -56,13 +56,12 @@ def extract_holds_in(db_path, table_name, limit=0):
         conn.close()
         return []
     
-    # Get columns for query
+    #get columns for query
     columns_to_fetch = ['uuid']
     if 'name' in columns:
         columns_to_fetch.append('name')
     columns_to_fetch.append('holds_in')
-    
-    # Prepare the query
+
     query = f"SELECT {', '.join(columns_to_fetch)} FROM {table_name} WHERE holds_in IS NOT NULL"
     
     if limit > 0:
@@ -73,11 +72,11 @@ def extract_holds_in(db_path, table_name, limit=0):
     rows = cursor.fetchall()
     print(f"Found {len(rows)} climbs with non-empty holds_in data")
     
-    # Convert to list of dictionaries
+    #convert to list of dictionaries
     results = []
     for row in rows:
         try:
-            # Parse holds_in as JSON
+            #paarse holds_in as JSON
             holds_in = json.loads(row['holds_in'])
             
             result = {
@@ -102,7 +101,7 @@ def generate_sequence_from_holds(holds):
     if not holds:
         return []
     
-    # Map holds by role
+    #map holds by role
     holds_by_role = defaultdict(list)
     for hold in holds:
         if 'role_id' in hold and 'id' in hold:
@@ -110,7 +109,7 @@ def generate_sequence_from_holds(holds):
     
     sequence = []
     
-    # Add start holds (role_id = 12)
+    #add start holds
     start_holds = holds_by_role.get(12, [])
     if not start_holds:
         # If no start holds defined, use the lowest holds
