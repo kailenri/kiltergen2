@@ -5,8 +5,7 @@ import matplotlib.pyplot as plt
 from collections import defaultdict
 from datetime import datetime
 
-def visualize_and_save_climb(climb_data, climb_id, output_dir="climb_visualizations"):
-    """Visualize a specific climb by ID and automatically save the image"""
+def visualizeclimb(climb_data, climb_id, output_dir="climb_visualizations"):
     # Create output directory if it doesn't exist
     os.makedirs(output_dir, exist_ok=True)
     
@@ -34,39 +33,35 @@ def visualize_and_save_climb(climb_data, climb_id, output_dir="climb_visualizati
         print("Climb has no holds or sequence")
         return False
     
-    # Create visualization
     plt.figure(figsize=(10, 12))
-    
-    # Draw grid
     plt.grid(True, linestyle='--', alpha=0.6)
     
-    # Draw all holds
     for hold in holds:
         x, y = hold.get('x', 0), hold.get('y', 0)
         role_id = hold.get('role_id', 13)
         name = hold.get('name', '')
         
         color = 'gray'
-        if role_id == 12:  # Start
+        if role_id == 12:  
             color = 'blue'
-        elif role_id == 14:  # Finish
+        elif role_id == 14:  
             color = 'red'
-        elif role_id == 15:  # Foot
+        elif role_id == 15:  
             color = 'green'
             
         plt.scatter(x, y, color=color, alpha=0.5, s=80 if role_id != 15 else 50)
         
-        # Add hold name or ID
+        #add hold name or ID
         label = name if name else f"{hold.get('hole_id', '')}"
         plt.text(x, y - 2, label, fontsize=6, ha='center', alpha=0.7)
     
-    # Draw sequence
+    #Draw sequence
     colors = {'RH': 'red', 'LH': 'blue', 'RF': 'green', 'LF': 'purple'}
     
-    # Create hold ID to hold mapping
+    #Create hold ID to hold mapping
     hold_map = {hold.get('hole_id'): hold for hold in holds if 'hole_id' in hold}
     
-    # Draw the sequence path
+    # draw thapath 
     sequence_holds = []
     for i, move in enumerate(sequence):
         hold_id = move.get('hold')
@@ -82,7 +77,7 @@ def visualize_and_save_climb(climb_data, climb_id, output_dir="climb_visualizati
             
             sequence_holds.append((x, y, limb))
     
-    # Connect holds with arrows
+    #connect path
     for i in range(1, len(sequence_holds)):
         prev_x, prev_y, _ = sequence_holds[i-1]
         curr_x, curr_y, curr_limb = sequence_holds[i]
@@ -91,19 +86,18 @@ def visualize_and_save_climb(climb_data, climb_id, output_dir="climb_visualizati
                 head_width=0.5, head_length=0.7, fc=colors.get(curr_limb, 'gray'), 
                 ec=colors.get(curr_limb, 'gray'), alpha=0.6)
     
-    # Add legend
     limb_labels = [plt.Line2D([0], [0], marker='o', color='w', 
                            markerfacecolor=color, markersize=10, label=limb)
                  for limb, color in colors.items()]
     
     plt.legend(handles=limb_labels, loc='upper right')
     
-    # Set labels and title
+    # titles
     plt.xlabel('X Position')
     plt.ylabel('Y Position')
     plt.title(f"{climb.get('name', 'Climb')} (ID: {climb_id})")
     
-    # Add climb info
+    #get info
     start_count = len([h for h in holds if h.get('role_id') == 12])
     hand_count = len([h for h in holds if h.get('role_id') == 13])
     finish_count = len([h for h in holds if h.get('role_id') == 14])
@@ -121,7 +115,7 @@ def visualize_and_save_climb(climb_data, climb_id, output_dir="climb_visualizati
     
     plt.tight_layout()
     
-    # Save the image
+    #Save the image
     plt.savefig(save_path)
     print(f"Visualization saved to {save_path}")
     plt.close()
@@ -137,7 +131,6 @@ def main():
     
     args = parser.parse_args()
     
-    # Load the data
     try:
         with open(args.data, 'r') as f:
             data = json.load(f)
@@ -145,8 +138,8 @@ def main():
         print(f"Error loading data file: {e}")
         return
     
-    # Visualize and save the climb
-    visualize_and_save_climb(data, args.id, args.output_dir)
+    #save
+    visualizeclimb(data, args.id, args.output_dir)
 
 if __name__ == "__main__":
     main()

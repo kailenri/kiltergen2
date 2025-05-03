@@ -6,7 +6,6 @@ from collections import defaultdict
 import random
 
 def setup_parser():
-    """Set up command line argument parser"""
     parser = argparse.ArgumentParser(
         description="Extract holds_in data from climbs database"
     )
@@ -36,7 +35,6 @@ def setup_parser():
     return parser
 
 def extract_holds_in(db_path, table_name, limit=0):
-    """Extract holds_in data from the database"""
     print(f"Connecting to database: {db_path}")
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
@@ -101,7 +99,6 @@ def extract_holds_in(db_path, table_name, limit=0):
     return results
 
 def generate_sequence_from_holds(holds):
-    """Generate a plausible climbing sequence from holds data"""
     if not holds:
         return []
     
@@ -113,7 +110,7 @@ def generate_sequence_from_holds(holds):
     
     sequence = []
     
-    # Add start holds (typically role_id = 12)
+    # Add start holds (role_id = 12)
     start_holds = holds_by_role.get(12, [])
     if not start_holds:
         # If no start holds defined, use the lowest holds
@@ -126,17 +123,15 @@ def generate_sequence_from_holds(holds):
             'limb': 'RH' if i == 0 else 'LH'
         })
     
-    # Add hand holds (typically role_id = 13)
     hand_holds = holds_by_role.get(13, [])
     if not hand_holds and holds:
-        # If no hand holds defined, use middle holds
         all_holds = sorted(holds, key=lambda h: h.get('y', 0))
         if len(all_holds) > 4:
-            hand_holds = all_holds[2:-2]  # Skip first 2 and last 2
+            hand_holds = all_holds[2:-2]
         else:
             hand_holds = all_holds
     
-    # Randomize a bit
+    #random suffle 
     if hand_holds:
         random.shuffle(hand_holds)
         hand_count = min(len(hand_holds), random.randint(3, 8))
@@ -147,11 +142,8 @@ def generate_sequence_from_holds(holds):
                 'hold': hold.get('id', hold.get('hole_id', str(i))),
                 'limb': limb
             })
-    
-    # Add finish holds (typically role_id = 14)
     finish_holds = holds_by_role.get(14, [])
     if not finish_holds and holds:
-        # If no finish holds defined, use the highest holds
         sorted_by_y = sorted(holds, key=lambda h: h.get('y', 0), reverse=True)
         finish_holds = sorted_by_y[:min(1, len(sorted_by_y))]
     
@@ -165,17 +157,13 @@ def generate_sequence_from_holds(holds):
     return sequence
 
 def save_json(results, output_path):
-    """Save results to JSON file"""
     data = {"results": results}
-    
     with open(output_path, 'w') as f:
         json.dump(data, f, indent=2)
-    
     print(f"Data saved to {output_path}")
     return True
 
 def main():
-    """Main entry point"""
     parser = setup_parser()
     args = parser.parse_args()
     

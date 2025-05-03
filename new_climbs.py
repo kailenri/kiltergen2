@@ -8,11 +8,10 @@ import numpy as np
 import matplotlib.pyplot as plt
 from datetime import datetime
 from collections import defaultdict
-from lstm import AdaptedClimbGenerator, ClimbLSTM
+from lstm import ClimbGenerator, ClimbLSTM
 
 class ClimbCreator:
     def __init__(self, model_path, data_file):
-        """Initialize with a trained model and data file for hold layouts"""
         self.data_file = data_file
         
         # Load data for hold layouts
@@ -21,7 +20,7 @@ class ClimbCreator:
         print(f"Loaded {len(self.wall_layouts)} wall layouts")
         
         # Load generator to utilize its dataset
-        self.generator = AdaptedClimbGenerator(data_file)
+        self.generator = ClimbGenerator(data_file)
         if not self.generator.load_model(model_path):
             print("Warning: Failed to load model. Some functionality may be limited.")
             
@@ -35,7 +34,6 @@ class ClimbCreator:
         self.reverse_role_mapping = {v: k for k, v in self.role_mapping.items()}
         
     def _load_wall_layouts(self, data_file):
-        """Extract unique wall layouts from the data file"""
         with open(data_file) as f:
             data = json.load(f)
             
@@ -73,7 +71,6 @@ class ClimbCreator:
         return wall_layouts
     
     def _get_wall_bounds(self, holds):
-        """Calculate the bounds of a wall from the holds"""
         if not holds:
             return {'min_x': 0, 'max_x': 100, 'min_y': 0, 'max_y': 100}
             
@@ -91,7 +88,6 @@ class ClimbCreator:
         }
         
     def list_wall_layouts(self):
-        """List all available wall layouts"""
         if not self.wall_layouts:
             print("No wall layouts found in the data file")
             return []
@@ -110,7 +106,6 @@ class ClimbCreator:
     
     def create_climb(self, wall_index=None, difficulty='moderate', start_holds=None, finish_holds=None, 
                      min_moves=6, max_moves=15):
-        """Create a new climbing route on a specified wall layout"""
         # Select a wall layout
         if wall_index is None:
             # Pick a random layout
@@ -248,7 +243,6 @@ class ClimbCreator:
         return new_climb
     
     def _create_sequence(self, holds):
-        """Create a climbing sequence from the selected holds"""
         # Sort holds by role and height
         sorted_holds = []
         
@@ -286,7 +280,6 @@ class ClimbCreator:
         return sequence
     
     def visualize_climb(self, climb, save_path=None):
-        """Visualize a climbing route"""
         if not climb or 'best_sequence' not in climb:
             print("Invalid climb data")
             return
@@ -389,7 +382,6 @@ class ClimbCreator:
         plt.close()
     
     def export_climbs(self, climbs, output_file="generated_climbs.json"):
-        """Export generated climbs to a JSON file"""
         output = {"results": climbs}
         
         with open(output_file, 'w') as f:
@@ -399,7 +391,6 @@ class ClimbCreator:
         return output_file
     
     def batch_generate(self, count=5, wall_indices=None, difficulties=None, output_file=None):
-        """Generate multiple climbing routes"""
         if not difficulties:
             difficulties = ['easy', 'moderate', 'hard']
             

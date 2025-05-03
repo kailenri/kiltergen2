@@ -8,10 +8,9 @@ from config import *
 import warnings
 
 def get_climbs_batch(offset: int, limit: int) -> List[Dict]:
-    """Fetch climbs in batches with proper row handling"""
     conn = sqlite3.connect(DB_PATH)
     try:
-        # Explicitly name the columns we're selecting
+        #explicitly name the columns we're selecting
         cursor = conn.execute("""
             SELECT uuid, holds_in, name 
             FROM climbs 
@@ -25,7 +24,7 @@ def get_climbs_batch(offset: int, limit: int) -> List[Dict]:
         processed = []
         for row in cursor.fetchall():
             try:
-                # Access columns by position since we're getting tuples
+                #Access columns by position since we're getting tuples
                 climb_uuid = row[0]
                 holds_json = row[1]
                 boulder_name = row[2]
@@ -45,7 +44,6 @@ def get_climbs_batch(offset: int, limit: int) -> List[Dict]:
         conn.close()
 
 def validate_holds(holds: List[Dict]) -> bool:
-    """Validate holds structure and required fields"""
     if not isinstance(holds, list):
         return False
         
@@ -55,34 +53,33 @@ def validate_holds(holds: List[Dict]) -> bool:
             return False
         if not all(k in h for k in required):
             return False
-        # More flexible role validation - accept any plausible role ID
+        #More flexible role validation - accept any plausible role ID
         if not isinstance(h['role_id'], (int, float)):
             return False
     return True
 
 def process_climb(climb: Dict) -> Dict:
-    """Process a single climb with robust error handling"""
     try:
         if not climb.get('holds'):
             return {'id': climb.get('id'), 'name': climb.get('name'), 'error': 'No holds data'}
             
-        # Create the generator and explicitly use configured beam width
+        #Create the generator and explicitly use configured beam width
         generator = ClimbSequenceGenerator(climb['holds'])
-        # Pass the BEAM_WIDTH from config
+        #pass the BEAM_WIDTH from config
         result = generator.generate_sequences(beam_width=BEAM_WIDTH)
         
         if result['status'] != 'success':
             return {
                 'id': climb['id'], 
-                'name': climb.get('name'),  # Include name in error case
+                'name': climb.get('name'),  #Include name in error case
                 'error': result.get('message', 'Unknown error')
             }
             
         return {
             'id': climb['id'],
-            'name': climb.get('name'),  # Include name in success case
+            'name': climb.get('name'),  #Include name in success case
             'best_sequence': result['best_sequence'],
-            'all_sequences': result.get('all_sequences', [])[:3],  # Save top 3 alternatives
+            'all_sequences': result.get('all_sequences', [])[:3],  #Save top 3 alternatives
             'stats': result['stats']
         }
     except Exception as e:
@@ -109,7 +106,7 @@ def main():
                 print("No more climbs to process")
                 break
                 
-            # Process current batch
+            #Process current batch
             for i, climb in enumerate(climbs):
                 batch_start = time.time()
                 print(f"\nProcessing climb {total_processed + i + 1}/{MAX_CLIMBS_TO_PROCESS}: {climb['id']}")
@@ -133,11 +130,11 @@ def main():
                     
             total_processed += len(climbs)
     
-    # Calculate statistics about the results
+    #Calculate statistics about the results
     successful = sum(1 for r in results if 'best_sequence' in r)
     failed = sum(1 for r in results if 'error' in r)
     
-    # Save results with metadata
+    #Save results with metadata
     output_file = f"climb_results_{int(time.time())}.json"
     with open(output_file, 'w') as f:
         json.dump({

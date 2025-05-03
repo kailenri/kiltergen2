@@ -11,8 +11,7 @@ import matplotlib.pyplot as plt
 import random
 from torch.nn import functional as F
 
-class AdaptedClimbDataset(Dataset):
-    """Dataset for loading and preprocessing climbing sequences from the provided format"""
+class ClimbDataset(Dataset):
     def __init__(self, json_file, max_sequence_length=50):
         print(f"Loading dataset from {json_file}")
         with open(json_file) as f:
@@ -26,23 +25,22 @@ class AdaptedClimbDataset(Dataset):
         self.max_sequence_length = max_sequence_length
         self.hold_info = {}
 
-        self._build_vocabulary_and_hold_info(data)
+        self._build_vocabulary(data)
         self._create_sequences(data)
         self.augment_sequences()
         
         self.vocab_size = (len(self.hold_mapping) * len(self.limb_mapping)) + 1
         print(f"Vocabulary size: {self.vocab_size}")
 
-    def _build_vocabulary_and_hold_info(self, data):
-        """Build vocabulary and hold info from climb data"""
+    def _build_vocabulary(self, data):
         hold_counter = 1
         
-        # Process all sequences to build vocab and hold info
+        #Process all sequences to build vocab and hold info
         for result in data['results']:
             if 'best_sequence' not in result:
                 continue
                 
-            # Add sequence holds to vocabulary
+            #Add sequence holds to vocabulary
             for move in result['best_sequence']['sequence']:
                 hold_id = move['hold']
                 if hold_id not in self.hold_mapping:
@@ -50,14 +48,14 @@ class AdaptedClimbDataset(Dataset):
                     self.reverse_hold_mapping[hold_counter] = hold_id
                     hold_counter += 1
 
-            # Add hold information (coordinates, roles)
+            #Add hold information (coordinates, roles)
             for h in result['best_sequence'].get('holds', []):
                 hold_id = h.get('hole_id')
                 if hold_id:
                     self.hold_info[hold_id] = {
                         'x': h.get('x', 0),
                         'y': h.get('y', 0),
-                        'role_id': h.get('role_id', 13),  # Default to hand hold
+                        'role_id': h.get('role_id', 13),  #Default to hand hold
                         'name': h.get('name', ''),
                         'climb_id': result.get('id', '')
                     }
@@ -66,7 +64,6 @@ class AdaptedClimbDataset(Dataset):
         print(f"Loaded information for {len(self.hold_info)} holds")
 
     def _create_sequences(self, data):
-        """Create training sequences from data"""
         total_sequences = valid_sequences = 0
         
         for result in data['results']:
@@ -82,12 +79,12 @@ class AdaptedClimbDataset(Dataset):
                     continue
                     
                 hold_token = self.hold_mapping[move['hold']]
-                limb_token = self.limb_mapping.get(move['limb'], 0)  # Default to RH if limb not found
+                limb_token = self.limb_mapping.get(move['limb'], 0)  #Default to RH if limb not found
                 encoded_sequence.append((hold_token * len(self.limb_mapping)) + limb_token + 1)
             
             if encoded_sequence:
                 valid_sequences += 1
-                # Pad or truncate sequence
+                #Pad or truncate sequence
                 if len(encoded_sequence) < self.max_sequence_length:
                     encoded_sequence += [0] * (self.max_sequence_length - len(encoded_sequence))
                 else:
@@ -98,15 +95,14 @@ class AdaptedClimbDataset(Dataset):
         print(f"Processed {total_sequences} sequences, {valid_sequences} valid")
 
     def augment_sequences(self):
-        """Data augmentation with multiple techniques"""
         original_count = len(self.sequences)
         new_sequences = []
         
-        # Mirroring technique
+        #mirroring technique
         for seq in self.sequences[:original_count]:
             mirrored = []
             for token in seq:
-                if token == 0:  # Padding
+                if token == 0:  #Padding
                     mirrored.append(0)
                     continue
                     
@@ -114,17 +110,17 @@ class AdaptedClimbDataset(Dataset):
                 hold_token = token // len(self.limb_mapping)
                 limb_token = token % len(self.limb_mapping)
                 
-                # Swap left and right limbs
+                #Swap left and right limbs
                 if limb_token in [self.limb_mapping['LH'], self.limb_mapping['RH']]:
-                    limb_token = 1 - limb_token  # Swap RH(0) and LH(1)
+                    limb_token = 1 - limb_token  #Swap RH(0) and LH(1)
                 elif limb_token in [self.limb_mapping['LF'], self.limb_mapping['RF']]:
-                    limb_token = 5 - limb_token  # Swap LF(2) and RF(3)
+                    limb_token = 5 - limb_token  #Swap LF(2) and RF(3)
                     
                 new_token = (hold_token * len(self.limb_mapping)) + limb_token + 1
                 mirrored.append(new_token)
             new_sequences.append(mirrored)
         
-        # Subsequence creation
+        #Subsequence creation
         min_subseq_length = 8
         for seq in self.sequences[:original_count]:
             actual_seq = [t for t in seq if t != 0]
@@ -134,7 +130,7 @@ class AdaptedClimbDataset(Dataset):
                     if len(half) >= min_subseq_length:
                         new_sequences.append(half + [0] * (self.max_sequence_length - len(half)))
         
-        # Jitter/noise
+        #jitter
         jitter_prob = 0.1
         for seq in self.sequences[:original_count]:
             if seq.count(0) <= len(seq) * 0.5:  # Skip mostly padded sequences
@@ -158,7 +154,6 @@ class AdaptedClimbDataset(Dataset):
         )
     
     def decode_sequence(self, encoded_sequence):
-        """Convert token sequence back to climbing moves"""
         decoded = []
         for token in encoded_sequence:
             if token == 0:
@@ -184,7 +179,6 @@ class AdaptedClimbDataset(Dataset):
         return decoded
 
 class FocalLoss(nn.Module):
-    """Focal Loss to handle class imbalance"""
     def __init__(self, gamma=2.0, alpha=None, ignore_index=0):
         super().__init__()
         self.gamma = gamma
@@ -197,7 +191,6 @@ class FocalLoss(nn.Module):
         return ((1 - pt) ** self.gamma * ce_loss).mean()
 
 class ClimbLSTM(nn.Module):
-    """LSTM model for generating climbing sequences"""
     def __init__(self, vocab_size, embedding_dim=128, hidden_dim=256, num_layers=2, dropout=0.2):
         super().__init__()
         self.embedding = nn.Embedding(vocab_size, embedding_dim, padding_idx=0)
@@ -212,7 +205,6 @@ class ClimbLSTM(nn.Module):
         self._init_weights()
         
     def _init_weights(self):
-        """Initialize weights for better convergence"""
         init_range = 0.1
         self.embedding.weight.data.uniform_(-init_range, init_range)
         self.fc.weight.data.uniform_(-init_range, init_range)
@@ -231,7 +223,6 @@ class ClimbLSTM(nn.Module):
         return self.fc(reshaped), hidden
 
 class EarlyStopping:
-    """Early stopping handler with weight restoration"""
     def __init__(self, patience=7, min_delta=0.001, restore_best_weights=True):
         self.patience = patience
         self.min_delta = min_delta
@@ -256,18 +247,16 @@ class EarlyStopping:
             return False
     
     def restore_weights(self, model):
-        """Restore model to best weights"""
         if self.restore_best_weights and self.best_weights is not None:
             model.load_state_dict(self.best_weights)
             print(f"Restored model to best weights from epoch {self.stopped_epoch - self.patience}")
 
-class AdaptedClimbGenerator:
-    """Class for training and generating climbing sequences with adapted data format"""
+class ClimbGenerator:
     def __init__(self, json_file):
-        print(f"Initializing AdaptedClimbGenerator")
+        print(f"Initializing ClimbGenerator")
         print(f"Data file: {json_file}")
         
-        self.dataset = AdaptedClimbDataset(json_file)
+        self.dataset = ClimbDataset(json_file)
         self.model = None
         self.climb_data = self._load_climb_data(json_file)
         self.role_mapping = {
@@ -278,7 +267,6 @@ class AdaptedClimbGenerator:
         }
         
     def _load_climb_data(self, json_file):
-        """Load climb data from JSON file"""
         with open(json_file) as f:
             data = json.load(f)
         
@@ -297,7 +285,6 @@ class AdaptedClimbGenerator:
         return climb_data
 
     def load_model(self, model_path):
-        """Load a trained model from file"""
         try:
             device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
             
@@ -321,17 +308,16 @@ class AdaptedClimbGenerator:
             return False
 
     def train(self, num_epochs=30, batch_size=32, learning_rate=0.001, save_path='lstm_model.pth'):
-        """Train the LSTM model on the dataset"""
         train_data, val_data = train_test_split(self.dataset, test_size=0.2, random_state=42, shuffle=True)
         
-        # Set up data loaders
+        #Set up data loaders
         train_loader = DataLoader(train_data, batch_size=batch_size, shuffle=True)
         val_loader = DataLoader(val_data, batch_size=batch_size)
         
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         print(f"Training on: {device}")
         
-        # Initialize model
+        #Initialize model
         self.model = ClimbLSTM(
             vocab_size=self.dataset.vocab_size,
             embedding_dim=128,
@@ -340,11 +326,11 @@ class AdaptedClimbGenerator:
             dropout=0.2
         ).to(device)
         
-        # Set up loss, optimizer and schedulers
+        #Set up loss, optimizer and schedulers
         criterion = FocalLoss(gamma=2.0, ignore_index=0)
         optimizer = optim.AdamW(self.model.parameters(), lr=learning_rate, weight_decay=1e-5)
         
-        # Learning rate warm-up and reduction
+        #Learning rate warm-up and reduction
         scheduler = torch.optim.lr_scheduler.OneCycleLR(
             optimizer, max_lr=learning_rate,
             steps_per_epoch=len(train_loader),
@@ -353,7 +339,7 @@ class AdaptedClimbGenerator:
         
         early_stopping = EarlyStopping(patience=7, restore_best_weights=True)
         
-        # Training loop
+        #Training loop
         train_losses, val_losses = [], []
         
         for epoch in range(num_epochs):
@@ -364,7 +350,7 @@ class AdaptedClimbGenerator:
             for inputs, targets in progress_bar:
                 inputs, targets = inputs.to(device), targets.to(device)
                 
-                # Skip batch if it contains invalid tokens
+                #Skip batch if it contains invalid tokens
                 if (inputs >= self.dataset.vocab_size).any() or (targets >= self.dataset.vocab_size).any():
                     print("Skipping batch with invalid token IDs")
                     continue
@@ -374,7 +360,7 @@ class AdaptedClimbGenerator:
                 loss = criterion(outputs.reshape(-1, self.dataset.vocab_size), targets.reshape(-1))
                 loss.backward()
                 
-                # Gradient clipping
+                #Gradient clipping
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
                 
                 optimizer.step()
@@ -383,10 +369,10 @@ class AdaptedClimbGenerator:
                 epoch_loss += loss.item()
                 progress_bar.set_postfix({"loss": f"{loss.item():.4f}"})
             
-            # Validation
+            #validation
             val_loss = self._evaluate(val_loader, criterion, device)
             
-            # Log metrics
+            #Log metrics
             avg_train_loss = epoch_loss / len(train_loader)
             avg_val_loss = val_loss / len(val_loader)
             train_losses.append(avg_train_loss)
@@ -394,25 +380,25 @@ class AdaptedClimbGenerator:
             
             print(f"Epoch {epoch+1}: Train Loss={avg_train_loss:.4f}, Val Loss={avg_val_loss:.4f}")
             
-            # Check for early stopping
+            #Check for early stopping
             if early_stopping(avg_val_loss, self.model):
                 print(f"Early stopping triggered at epoch {epoch+1}")
                 early_stopping.restore_weights(self.model)
                 break
             
-            # Generate a sample sequence every 5 epochs
+            #Generate a sample sequence every 5 epochs
             if (epoch + 1) % 5 == 0:
                 self._generate_sample(device)
         
-        # Ensure best weights are used
+        #Ensure best weights are used
         if not early_stopping.stopped_epoch and early_stopping.best_weights is not None:
             self.model.load_state_dict(early_stopping.best_weights)
         
-        # Save the model
+        #Save the model
         torch.save(self.model.state_dict(), save_path)
         print(f"Model saved to {save_path}")
         
-        # Plot training history
+        #Plot training history
         self._plot_training_history(train_losses, val_losses)
         
         return train_losses, val_losses
@@ -426,7 +412,7 @@ class AdaptedClimbGenerator:
             for inputs, targets in loader:
                 inputs, targets = inputs.to(device), targets.to(device)
                 
-                # Skip batch if it contains invalid tokens
+                #Skip batch if it contains invalid tokens
                 if (inputs >= self.dataset.vocab_size).any() or (targets >= self.dataset.vocab_size).any():
                     continue
                 
@@ -437,29 +423,28 @@ class AdaptedClimbGenerator:
         return total_loss
 
     def _generate_sample(self, device, temp=0.8):
-        """Generate and print a sample sequence during training"""
         self.model.eval()
         
         with torch.no_grad():
-            # Get a random climb ID
+            #Get a random climb ID
             if self.climb_data:
                 climb_id = random.choice(list(self.climb_data.keys()))
                 print(f"\nGenerating sample sequence for climb: {self.climb_data[climb_id]['name']}")
                 
-                # Get start holds from the climb
+                #Get start holds from the climb
                 start_holds = []
                 for hold in self.climb_data[climb_id]['holds']:
                     hold_id = hold.get('hole_id')
                     if hold_id and hold.get('role_id') == 12:  # Start hold
                         start_holds.append(hold_id)
                 
-                # If no start holds found, get the lowest 2 holds
+                #If no start holds found, get the lowest 2 holds
                 if not start_holds:
                     sorted_holds = sorted(self.climb_data[climb_id]['holds'], 
                                           key=lambda h: h.get('y', 0))
                     start_holds = [h.get('hole_id') for h in sorted_holds[:2]]
                 
-                # Generate sequence using up to 2 start holds
+                #Generate sequence using up to 2 start holds
                 sequence = []
                 for i, hold_id in enumerate(start_holds[:2]):
                     if hold_id in self.dataset.hold_mapping:
@@ -468,16 +453,16 @@ class AdaptedClimbGenerator:
                         limb_token = self.dataset.limb_mapping[limb]
                         sequence.append((hold_token * len(self.dataset.limb_mapping)) + limb_token + 1)
                 
-                # Generate the rest of the sequence
+                #Generate the rest of the sequence
                 if sequence:
                     input_seq = torch.tensor([sequence], dtype=torch.long).to(device)
                     output, hidden = self.model(input_seq)
                     
-                    for _ in range(20):  # Generate up to 20 more moves
+                    for _ in range(20):  #Generate up to 20 more moves
                         logits = output[0, -1, :] / temp
-                        logits[0] = float('-inf')  # Don't predict padding
+                        logits[0] = float('-inf')   ##Don't predict padding
                         
-                        # Sample from the distribution
+                        #Sample from the distribution
                         next_token = torch.multinomial(F.softmax(logits, dim=-1), num_samples=1).item()
                         
                         if next_token == 0:
@@ -488,7 +473,7 @@ class AdaptedClimbGenerator:
                         input_seq = torch.tensor([[next_token]], dtype=torch.long).to(device)
                         output, hidden = self.model(input_seq, hidden)
                     
-                    # Decode and print the sequence
+                    #Decode and print the sequence
                     decoded = self.dataset.decode_sequence(sequence)
                     print(f"Generated sequence with {len(decoded)} moves:")
                     for i, move in enumerate(decoded[:10]):  # Print first 10 moves
@@ -503,7 +488,6 @@ class AdaptedClimbGenerator:
         self.model.train()
 
     def _plot_training_history(self, train_losses, val_losses):
-        """Plot training and validation loss history"""
         plt.figure(figsize=(10, 6))
         plt.plot(train_losses, label='Training Loss')
         plt.plot(val_losses, label='Validation Loss')
@@ -516,7 +500,6 @@ class AdaptedClimbGenerator:
         plt.close()
 
     def generate(self, climb_id=None, num_sequences=3, temperature=0.8, max_length=30):
-        """Generate climbing sequences"""
         if not self.model:
             print("Error: Model not loaded")
             return []
@@ -524,7 +507,7 @@ class AdaptedClimbGenerator:
         device = next(self.model.parameters()).device
         sequences = []
         
-        # Get climb IDs to generate for
+        #Get climb IDs to generate 
         climb_ids = [climb_id] if climb_id else list(self.climb_data.keys())
         if not climb_ids:
             print("No climb data available")
@@ -533,27 +516,27 @@ class AdaptedClimbGenerator:
         print(f"Generating sequences for {len(climb_ids)} climbs, temperature={temperature}")
         
         for i in range(num_sequences):
-            # Pick a random climb if multiple are available
+            #Pick a random climb if multiple are available
             current_id = climb_id if climb_id else random.choice(climb_ids)
             print(f"\nGenerating sequence {i+1} for climb: {self.climb_data[current_id]['name']}")
             
-            # Get start holds
+            #Get start holds
             start_holds = []
             for hold in self.climb_data[current_id]['holds']:
                 hold_id = hold.get('hole_id')
                 if hold_id and hold.get('role_id') == 12:  # Start hold
                     start_holds.append((hold_id, 'RH' if len(start_holds) == 0 else 'LH'))
             
-            # If no start holds found, use any holds from vocabulary
+            #If no start holds found, use any holds from vocabulary
             if not start_holds:
-                # Try to get from the lowest holds
+                #Try to get from the lowest holds
                 if self.climb_data[current_id]['holds']:
                     sorted_holds = sorted(self.climb_data[current_id]['holds'], 
                                         key=lambda h: h.get('y', 0))
                     start_holds = [(h.get('hole_id'), 'RH' if i == 0 else 'LH') 
                                 for i, h in enumerate(sorted_holds[:2])]
                 
-                # If still no valid holds, use any holds from vocabulary
+                #If still no valid holds, use any holds from vocabulary
                 if not start_holds:
                     valid_holds = list(self.dataset.hold_mapping.keys())
                     if 'PAD' in valid_holds:
@@ -568,7 +551,7 @@ class AdaptedClimbGenerator:
                 print(f"No valid start holds found for climb {current_id}")
                 continue
                 
-            # Generate sequence using start holds
+            #Generate sequence using start holds
             current_tokens = []
             for hold_id, limb in start_holds:
                 if hold_id in self.dataset.hold_mapping:
@@ -582,7 +565,7 @@ class AdaptedClimbGenerator:
                 
             print(f"Using {len(current_tokens)} start tokens")
                 
-            # Generate the sequence
+            #Generate the sequence
             sequence_tokens = current_tokens.copy()
             
             try:
@@ -592,9 +575,9 @@ class AdaptedClimbGenerator:
                     
                     for _ in range(max_length):
                         logits = output[0, -1, :] / temperature
-                        logits[0] = float('-inf')  # Don't predict padding
+                        logits[0] = float('-inf')
                         
-                        # Top-p (nucleus) sampling
+                        #Top-p (nucleus) sampling
                         sorted_logits, sorted_indices = torch.sort(logits, descending=True)
                         cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
                         
@@ -615,20 +598,20 @@ class AdaptedClimbGenerator:
                         input_seq = torch.tensor([[next_token]], dtype=torch.long).to(device)
                         output, hidden = self.model(input_seq, hidden)
                 
-                # Decode the sequence
+                #Decode
                 decoded_sequence = self.dataset.decode_sequence(sequence_tokens)
                 
-                # Validate and clean up the sequence
+                #Validate and clean
                 valid_sequence = self._validate_sequence(decoded_sequence, current_id)
                 
                 sequences.append({
                     'climb_id': current_id,
                     'climb_name': self.climb_data[current_id]['name'],
                     'sequence': valid_sequence,
-                    'is_valid': len(valid_sequence) >= 3  # At least 3 moves
+                    'is_valid': len(valid_sequence) >= 3  #min 3 moves
                 })
                 
-                # Print summary of the sequence
+                #sequence summary
                 print(f"Generated sequence with {len(valid_sequence)} moves")
                 valid_moves = 0
                 for move in valid_sequence[:5]:
@@ -646,11 +629,10 @@ class AdaptedClimbGenerator:
         return sequences
 
     def _validate_sequence(self, sequence, climb_id):
-        """Validate and clean up a generated sequence"""
         if not sequence:
             return []
         
-        # Ensure all holds exist in the climb if possible
+        #make sure all holds exist in the climb
         valid_hold_ids = set()
         start_holds = set()
         finish_holds = set()
@@ -662,29 +644,26 @@ class AdaptedClimbGenerator:
             finish_holds = {h.get('hole_id') for h in self.climb_data[climb_id]['holds'] 
                            if h.get('role_id') == 14}
         
-        # If there are valid hold IDs, filter the sequence
         if valid_hold_ids:
             cleaned = [m for m in sequence if m['hold'] in valid_hold_ids]
         else:
-            # Otherwise keep all holds
             cleaned = sequence.copy()
         
-        # Ensure hands alternate properly
+        #make sure there is hand alternation
         last_hand = None
         alternated = []
         
         for move in cleaned:
             if move['limb'] in ['RH', 'LH']:
-                # If limb is same as last hand, change it
                 if last_hand == move['limb']:
                     move['limb'] = 'LH' if move['limb'] == 'RH' else 'RH'
                 last_hand = move['limb']
             alternated.append(move)
         
-        # Ensure the sequence ends with a finish hold if possible
+        #makes sure the sequence ends with a finish hold
         has_finish = any(m['hold'] in finish_holds for m in alternated[-2:]) if finish_holds else False
         
-        # Add a finish hold if needed and available
+        #add finish if there is noen
         if not has_finish and finish_holds:
             last_hand = alternated[-1]['limb'] if alternated and alternated[-1]['limb'] in ['RH', 'LH'] else 'RH'
             next_hand = 'LH' if last_hand == 'RH' else 'RH'
@@ -702,14 +681,13 @@ class AdaptedClimbGenerator:
         return alternated
 
     def visualize_sequence(self, sequence, climb_id=None, save_path=None):
-        """Visualize a climbing sequence"""
         if not sequence:
             print("No sequence to visualize")
             return
         
         plt.figure(figsize=(10, 12))
         
-        # Draw grid
+        #Draw grid
         plt.grid(True, linestyle='--', alpha=0.6)
         
         # Get all holds for this climb
@@ -781,18 +759,16 @@ class AdaptedClimbGenerator:
         plt.close()
         
     def _calculate_sequence_stats(self, sequence):
-        """Calculate statistics for a sequence"""
         if not sequence:
             return {}
-            
-        # Extract coordinates
+        
         coords = [(move['x'], move['y']) for move in sequence 
                  if 'x' in move and 'y' in move]
         
         if len(coords) < 2:
             return {}
             
-        # Calculate distances between consecutive holds
+        #distances between consecutive holds
         distances = []
         for i in range(1, len(coords)):
             x1, y1 = coords[i-1]
@@ -800,12 +776,10 @@ class AdaptedClimbGenerator:
             dist = np.sqrt((x2-x1)**2 + (y2-y1)**2)
             distances.append(dist)
         
-        # Count limb usage
+        #limb usage count
         limb_counts = defaultdict(int)
         for move in sequence:
             limb_counts[move['limb']] += 1
-        
-        # Unique holds
         unique_holds = len(set(move['hold'] for move in sequence))
         
         return {
@@ -820,7 +794,6 @@ class AdaptedClimbGenerator:
         }
         
     def export_sequences(self, sequences, output_file="generated_sequences.json"):
-        """Export generated sequences to a JSON file"""
         output = {
             "results": [
                 {

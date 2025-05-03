@@ -54,7 +54,6 @@ def process_climbs() -> List[Dict]:
         conn.close()
 
 def parse_frames_string(frames: str, conn: sqlite3.Connection) -> List[Dict]:
-    """Parse frames string into holds data with better missing hold handling"""
     pattern = re.compile(r'p(\d+)r(\d+)')
     matches = pattern.findall(frames)
     
@@ -62,7 +61,7 @@ def parse_frames_string(frames: str, conn: sqlite3.Connection) -> List[Dict]:
     missing_placements = set()
     placement_ids_to_check = {int(placement_id_str) for placement_id_str, _ in matches}
     
-    # Pre-check which placement IDs exist in the database and get their hole_ids
+    #check placement id and get hole id
     placement_to_hole_map = {}
     cursor = conn.execute("""
         SELECT p.id, p.hole_id, h.x, h.y, h.name 
@@ -86,7 +85,6 @@ def parse_frames_string(frames: str, conn: sqlite3.Connection) -> List[Dict]:
         print("These placements are referenced in frames but don't exist in the placements table.")
         print("This will affect sequence generation for these climbs.")
     
-    # Now process only the existing placements
     for placement_id_str, role_id_str in matches:
         placement_id = int(placement_id_str)
         if placement_id not in placement_to_hole_map:
@@ -96,7 +94,7 @@ def parse_frames_string(frames: str, conn: sqlite3.Connection) -> List[Dict]:
             role_id = int(role_id_str)
             hole_data = placement_to_hole_map[placement_id]
             
-            # Get role data
+            #get role data
             role = conn.execute("SELECT position FROM placement_roles WHERE id = ?", (role_id,)).fetchone()
             
             holds.append({

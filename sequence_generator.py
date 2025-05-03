@@ -41,7 +41,6 @@ class ClimbSequenceGenerator:
         self._print_timing('Initialization')
 
     def _calculate_distances(self) -> np.ndarray:
-        """Calculate pairwise distances between all holds"""
         dx = self.hold_coords[:,0,None] - self.hold_coords[:,0]
         dy = self.hold_coords[:,1,None] - self.hold_coords[:,1]
         distances = np.sqrt(dx**2 + dy**2)
@@ -49,25 +48,24 @@ class ClimbSequenceGenerator:
         return distances
 
     def _compute_hand_reachability_matrix(self) -> np.ndarray:
-        """Compute which holds are reachable by hands from each hold"""
         n = len(self.holds)
         reachable = np.zeros((n, n), dtype=bool)
 
-        # Hand holds can reach other hand holds within MAX_HAND_REACH
+        #make sure holds are within max reach
         is_hand = np.array([h['role_id'] in {12, 13, 14} for h in self.holds])
         reachable = (self.hold_distances <= MAX_HAND_REACH) & is_hand[:,None] & is_hand
 
-        # Special cases for start and finish holds
+        #marks start and finish 
         start_indices = [i for i, h in enumerate(self.holds) if h['role_id'] == 12]
         finish_indices = [i for i, h in enumerate(self.holds) if h['role_id'] == 14]
 
-        # Can't move from non-start holds to start holds
+        #making sure you start at the start holds
         for j in start_indices:
             reachable[:,j] = False
             for i in start_indices:
                 reachable[i,j] = True
 
-        # Can't move from finish holds
+        #end on finish 
         for i in finish_indices:
             reachable[i,:] = False
             for j in finish_indices:
@@ -80,13 +78,11 @@ class ClimbSequenceGenerator:
         n = len(self.holds)
         reachable = np.zeros((n, n), dtype=bool)
 
-        # Feet can reach all holds within MAX_FOOT_REACH
+        #compute all reachable holds within the max distance
         reachable = self.hold_distances <= MAX_FOOT_REACH
-
-        # Special restrictions for feet
         for i in range(n):
             for j in range(n):
-                # Can't reach holds that are too high up (unless it's a start hold)
+                #makes higher holds unreachaable 
                 if self.holds[j]['role_id'] != 12:  # Not a start hold
                     if self.holds[j]['y'] < self.holds[i]['y'] - X_SPACING * 1.5:
                         reachable[i, j] = False
@@ -103,7 +99,7 @@ class ClimbSequenceGenerator:
         return sorted(holds, key=lambda h: h['x'])
 
     def _create_hold_grid(self) -> Dict[float, List[Dict]]:
-        """Create a grid of holds organized by y-coordinate"""
+        # creates a grid of each hold based on the Y coords
         grid = defaultdict(list)
         with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
             chunk_size = max(1, len(self.holds) // (self.num_workers * 4))
@@ -128,20 +124,20 @@ class ClimbSequenceGenerator:
 
     @lru_cache(maxsize=100000)
     def is_valid_hand_transition(self, current_id: int, next_id: int, limb: str, current_limbs: Tuple) -> bool:
-        """Check if a hand transition is valid based on reach and other constraints"""
+        #ensures that the hand transition is valid based on constraints
         next_hold = self.hold_dict[next_id]
         
-        # Only consider valid hand holds
+        #consider only valid holds
         if next_hold['role_id'] not in {12, 13, 14}:
             return False
             
-        # Check if hold is already occupied by another limb
+        #checks if hold is occupied 
         for other_limb, hold_id in current_limbs:
             if other_limb != limb and hold_id == next_id:
                 return False
         
-        # Check reach distance using precomputed matrix
-        if current_id != -1:  # If not initial placement
+        #checks reachability
+        if current_id != -1:  
             i = self.hold_ids.index(current_id)
             j = self.hold_ids.index(next_id)
             if not self.hand_reach_matrix[i, j]:
@@ -153,13 +149,13 @@ class ClimbSequenceGenerator:
         """Check if a foot transition is valid based on reach and other constraints"""
         next_hold = self.hold_dict[next_id]
         
-        # Check if hold is already occupied by another limb
+        #checks if hold is occupied 
         for other_limb, hold_id in current_limbs:
             if other_limb != limb and hold_id == next_id:
                 return False
         
-        # Check reach distance using precomputed matrix
-        if current_id != -1:  # If not initial placement
+        #checks reachability
+        if current_id != -1:  
             i = self.hold_ids.index(current_id)
             j = self.hold_ids.index(next_id)
             if not self.foot_reach_matrix[i, j]:
@@ -193,26 +189,26 @@ class ClimbSequenceGenerator:
             limb = move['limb']
             limb_positions[limb] = (hold['x'], hold['y'])
             
-            # Hold quality scoring
-            if hold['role_id'] == 14:  # Finish hold
+            #quality scoring
+            if hold['role_id'] == 14:  
                 metrics['hold_quality'] += 10
-            elif hold['role_id'] == 12:  # Start hold
+            elif hold['role_id'] == 12:  
                 metrics['hold_quality'] += 5
             else:  # Regular hold
                 metrics['hold_quality'] += 1
 
-            # Movement efficiency - reward shorter moves
+            #reward shorter moves - efficiency 
             if i > 0:
                 prev_hold = self.hold_dict[sequence[i-1]['hold']]
                 dist = math.hypot(hold['x']-prev_hold['x'], hold['y']-prev_hold['y'])
                 # Give higher scores for more efficient movements
                 metrics['movement_efficiency'] += 1/(dist + 0.1)
 
-            # Limb alternation (hands only)
+            #reward alternating limbs
             if limb in ['RH', 'LH'] and prev_limb in ['RH', 'LH'] and limb != prev_limb:
                 metrics['limb_alternation'] += 1
             
-            # Cross prevention - penalize crossed arms or legs
+            #penalize crossed arms or legs
             if all(pos is not None for pos in [limb_positions['RH'], limb_positions['LH']]):
                 if limb_positions['RH'][0] < limb_positions['LH'][0]:  # RH is left of LH (crossed)
                     metrics['cross_prevention'] -= 5
@@ -221,34 +217,34 @@ class ClimbSequenceGenerator:
                 if limb_positions['RF'][0] < limb_positions['LF'][0]:  # RF is left of LF (crossed)
                     metrics['cross_prevention'] -= 3
             
-            # Body position - reward stable triangular positions
+            #reward stable triangular positions
             if all(pos is not None for pos in [limb_positions['RH'], limb_positions['LH'], 
                                              limb_positions['RF'], limb_positions['LF']]):
-                # Calculate center of gravity
+                #calc center of gravity
                 cog_x = sum(pos[0] for pos in limb_positions.values())/4
                 cog_y = sum(pos[1] for pos in limb_positions.values())/4
                 
-                # Check if CoG is within the support polygon formed by feet
+                #check if COG is within the support polygon
                 min_foot_x = min(limb_positions['RF'][0], limb_positions['LF'][0])
                 max_foot_x = max(limb_positions['RF'][0], limb_positions['LF'][0])
                 
                 if min_foot_x <= cog_x <= max_foot_x:
-                    metrics['body_position'] += 2  # Good stability
+                    metrics['body_position'] += 2  #stable
                 else:
-                    metrics['body_position'] += 0.5  # Less stable
+                    metrics['body_position'] += 0.5  #less stable
                     
-                # Reward hands being higher than feet
+                #rewards hands being higher than feet
                 if min(limb_positions['RH'][1], limb_positions['LH'][1]) > max(limb_positions['RF'][1], limb_positions['LF'][1]):
                     metrics['body_position'] += 1
                     
             prev_limb = limb
             limb_use[limb] += 1
 
-        # Completion bonus
+        #bonus for completion
         last_move = sequence[-1]
         metrics['completion'] = 10 if self.hold_dict[last_move['hold']]['role_id'] == 14 else 0
 
-        # Normalize metrics
+        #norm
         seq_len = len(sequence)
         if seq_len > 1:
             metrics['movement_efficiency'] /= (seq_len - 1)
@@ -257,10 +253,10 @@ class ClimbSequenceGenerator:
         if hand_moves > 1:
             metrics['limb_alternation'] /= (hand_moves - 1)
             
-        # Normalize cross prevention to a 0-5 range
+        #normalize
         metrics['cross_prevention'] = max(0, metrics['cross_prevention'] + 5)
 
-        # Weight and combine metrics
+        #adding weights
         weights = {
             'hold_quality': 0.15,
             'movement_efficiency': 0.20,
@@ -280,8 +276,7 @@ class ClimbSequenceGenerator:
         }
 
     def generate_sequences(self, beam_width: int = None) -> Dict[str, Any]:
-        """Generate climbing sequences using beam search"""
-        # Use configured beam width if none provided
+        #generate sequences using beam
         beam_width = beam_width or BEAM_WIDTH
         
         self._start_timer('total_search')
@@ -292,7 +287,7 @@ class ClimbSequenceGenerator:
 
         with tqdm(desc="Generating sequences", unit="iter") as pbar:
             while beam and iterations < MAX_ITERATIONS:
-                # Split beam for parallel processing
+                #split for parallel processing
                 with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
                     chunk_size = max(1, len(beam) // (self.num_workers * 2))
                     futures = [
@@ -301,14 +296,14 @@ class ClimbSequenceGenerator:
                     ]
                     next_beam = list(chain(*[f.result() for f in futures]))
 
-                # Keep only the best states for the next iteration
+                #keep the best states for the next iteration
                 beam = heapq.nlargest(
                     beam_width * 5,
                     next_beam,
                     key=lambda x: (x['score'], -len(x['sequence']))
                 )[:beam_width]
 
-                # Check for completed sequences
+                #check for completed sequences
                 for state in beam:
                     if self._is_complete(state):
                         evaluation = self.evaluate_sequence(state['sequence'])
@@ -319,7 +314,7 @@ class ClimbSequenceGenerator:
                 iterations += 1
                 pbar.update(1)
                 
-                # If we've found enough complete sequences, we can stop early
+                #stop if there are completed sequences
                 if len(completed_sequences) >= beam_width * 2:
                     break
 
@@ -328,7 +323,7 @@ class ClimbSequenceGenerator:
         if not completed_sequences:
             return {'status': 'error', 'message': 'No valid sequences found'}
 
-        # Sort completed sequences by evaluation score
+        #sort by evaluation score
         completed_sequences.sort(key=lambda x: x['evaluation']['score'], reverse=True)
         
         best_seq = completed_sequences[0]
@@ -348,18 +343,17 @@ class ClimbSequenceGenerator:
         """Expand each state by trying all possible limb movements"""
         new_states = []
         for state in tqdm(states, desc="Expanding states", leave=False):
-            # Skip completed states
+            #skip completed states
             if self._is_complete(state):
-                new_states.append(state)  # Keep completed states in the beam
+                new_states.append(state)
                 continue
 
-            # Convert limbs dict to tuple for caching
+            #convert limbs dict to tuple
             current_limbs_tuple = tuple(sorted(
                 (limb, hold['hole_id'] if hold else -1) 
                 for limb, hold in state['limbs'].items()
             ))
 
-            # Hand movements
             for limb in ['RH', 'LH']:
                 current = state['limbs'][limb]
                 current_id = current['hole_id'] if current else -1
@@ -368,15 +362,15 @@ class ClimbSequenceGenerator:
                     next_id = next_hold['hole_id']
                     if current_id != next_id and self.is_valid_hand_transition(
                             current_id, next_id, limb, current_limbs_tuple):
-                        # Create new state with this hand movement
+                        #new state with this hand movement
                         new_limbs = {k: v for k, v in state['limbs'].items()}
                         new_limbs[limb] = next_hold
                         
-                        # Calculate state score based on hold and other factors
+                        #calculate state score based on hold and quality
                         move_score = 1
-                        if next_hold['role_id'] == 14:  # Finish hold
+                        if next_hold['role_id'] == 14: 
                             move_score = 10
-                        elif next_hold['role_id'] == 12:  # Start hold
+                        elif next_hold['role_id'] == 12: 
                             move_score = 5
                             
                         new_states.append({
@@ -389,7 +383,7 @@ class ClimbSequenceGenerator:
                             'score': state['score'] + move_score
                         })
                         
-            # Foot movements
+            #feeeet
             for limb in ['RF', 'LF']:
                 current = state['limbs'].get(limb, None)
                 current_id = current['hole_id'] if current else -1
@@ -398,11 +392,11 @@ class ClimbSequenceGenerator:
                     next_id = next_hold['hole_id']
                     if current_id != next_id and self.is_valid_foot_transition(
                             current_id, next_id, limb, current_limbs_tuple):
-                        # Create new state with this foot movement
+                        #new state
                         new_limbs = {k: v for k, v in state['limbs'].items()}
                         new_limbs[limb] = next_hold
                         
-                        # Foot moves get lower scores
+                        #lower scores for foot movements
                         move_score = 0.5
                         
                         new_states.append({
@@ -418,11 +412,10 @@ class ClimbSequenceGenerator:
         return new_states
 
     def _initialize_beam(self):
-        """Initialize the beam with valid starting positions"""
-        # Get potential start positions
+        #initilize with start positions
         beam = []
         
-        # Start with just hands on start holds (simpler approach)
+        #just hands on start holds
         for rh in self.start_holds:
             for lh in self.start_holds:
                 if rh != lh:  # Different holds for each hand
@@ -438,7 +431,7 @@ class ClimbSequenceGenerator:
                         'score': 0
                     })
         
-        # If beam is empty, try allowing the same hold for both hands
+        #allowing the same hold for both hands
         if not beam and self.start_holds:
             for h in self.start_holds:
                 beam.append({
@@ -452,7 +445,7 @@ class ClimbSequenceGenerator:
                     'score': 0
                 })
         
-        # Make sure we have some starting positions
+        #check for starting positions
         if not beam:
             raise ValueError("Could not create valid starting positions")
             
@@ -461,8 +454,6 @@ class ClimbSequenceGenerator:
     def _score_initial_position(self, state):
         """Score initial positions based on naturalness"""
         limbs = state['limbs']
-        
-        # Check if we have the required limbs
         if not all(limb in limbs for limb in ['RH', 'LH']):
             return 0
             
@@ -474,7 +465,7 @@ class ClimbSequenceGenerator:
         if limbs.get('RF') and limbs.get('LF'):
             foot_width = abs(limbs['RF']['x'] - limbs['LF']['x'])
             
-        # Check if hands are above feet
+        #checks if hands are above feet
         hands_above_feet = False
         if all(limbs.get(limb) for limb in ['RH', 'LH', 'RF', 'LF']):
             min_hand_y = min(limbs['RH']['y'], limbs['LH']['y'])
@@ -485,7 +476,6 @@ class ClimbSequenceGenerator:
         return score
 
     def _is_complete(self, state):
-        """Check if a climb is complete (at least one hand on a finish hold)"""
         limbs = state['limbs']
         return (limbs['RH'] and limbs['RH']['role_id'] == 14) or \
                (limbs['LH'] and limbs['LH']['role_id'] == 14)
