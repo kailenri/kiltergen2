@@ -10,8 +10,8 @@ from pathlib import Path
 from lstm import ClimbGenerator
 
 
-def init_generator(data_path, model_path=None):
-    generator = ClimbGenerator(data_path)
+def init_generator(data_path, model_path=None, vocab_path=None):
+    generator = ClimbGenerator(data_path, vocab_path=vocab_path)
     if model_path:
         if not generator.load_model(model_path):
             print("Failed to load model. Exiting.")
@@ -51,6 +51,10 @@ def setup_parser():
         "--output", 
         default="lstm_model.pth", 
         help="Path to save trained model"
+    )
+    train_parser.add_argument(
+        "--vocab",
+        help="Path to vocab.json to load or save",
     )
     
 
@@ -97,6 +101,10 @@ def setup_parser():
         action="store_true", 
         help="Export sequences as JSON file"
     )
+    gen_parser.add_argument(
+        "--vocab",
+        help="Path to vocab.json to load (optional)",
+    )
     
     #Visualize mode
     vis_parser = subparsers.add_parser("visualize", help="Visualize climbing sequences")
@@ -137,13 +145,17 @@ def setup_parser():
         choices=["path", "cycle", "reachability-hand", "reachability-foot", "hold-density"],
         help="Type of visualization to generate",
     )
+    vis_parser.add_argument(
+        "--vocab",
+        help="Path to vocab.json to load (optional)",
+    )
     
     return parser
 
 def train_model(args):
     print(f"Starting training with data from: {args.data}")
     print(f"Training parameters: epochs={args.epochs}, batch_size={args.batch_size}, lr={args.learning_rate}")
-    generator = init_generator(args.data)
+    generator = init_generator(args.data, vocab_path=args.vocab)
     
     #train LSTM
     train_losses, val_losses = generator.train(
@@ -165,7 +177,7 @@ def generate_sequences(args):
     os.makedirs(args.output_dir, exist_ok=True)
     
     #Initialize generator and load model
-    generator = init_generator(args.data, args.model)
+    generator = init_generator(args.data, args.model, vocab_path=args.vocab)
     if not generator:
         return
     
@@ -191,7 +203,7 @@ def visualize_sequences(args):
     os.makedirs(args.output_dir, exist_ok=True)
     
     #load model
-    generator = init_generator(args.data, args.model)
+    generator = init_generator(args.data, args.model, vocab_path=args.vocab)
     if not generator:
         return
     

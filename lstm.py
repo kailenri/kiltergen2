@@ -13,7 +13,7 @@ from torch.nn import functional as F
 from viz import plot_climb_sequence, plot_sequence_cycle, plot_reachability_map, plot_hold_density
 
 class ClimbDataset(Dataset):
-    def __init__(self, json_file, max_sequence_length=50):
+    def __init__(self, json_file, max_sequence_length=50, vocab_path=None):
         print(f"Loading dataset from {json_file}")
         with open(json_file) as f:
             data = json.load(f)
@@ -26,12 +26,54 @@ class ClimbDataset(Dataset):
         self.max_sequence_length = max_sequence_length
         self.hold_info = {}
 
-        self._build_vocabulary(data)
+        if vocab_path:
+            # load an existing vocabulary to ensure reproducible token ids
+            self.load_vocab(vocab_path)
+        else:
+            self._build_vocabulary(data)
         self._create_sequences(data)
         self.augment_sequences()
         
         self.vocab_size = (len(self.hold_mapping) * len(self.limb_mapping)) + 1
         print(f"Vocabulary size: {self.vocab_size}")
+
+    def save_vocab(self, path):
+        payload = {
+            'hold_mapping': {str(k): v for k, v in self.hold_mapping.items()},
+            'reverse_hold_mapping': {str(k): v for k, v in self.reverse_hold_mapping.items()},
+            'limb_mapping': self.limb_mapping,
+            'role_mapping': self.role_mapping
+        }
+        with open(path, 'w') as f:
+            json.dump(payload, f, indent=2)
+
+    def load_vocab(self, path):
+        with open(path) as f:
+            payload = json.load(f)
+
+        # JSON keys are strings; convert to ints where appropriate
+        hold_mapping = {}
+        for k, v in payload.get('hold_mapping', {}).items():
+            try:
+                key = int(k)
+            except Exception:
+                key = k
+            hold_mapping[key] = v
+
+        reverse_mapping = {}
+        for k, v in payload.get('reverse_hold_mapping', {}).items():
+            try:
+                key = int(k)
+            except Exception:
+                key = k
+            reverse_mapping[int(key)] = v
+
+        self.hold_mapping = hold_mapping
+        self.reverse_hold_mapping = reverse_mapping
+        self.limb_mapping = payload.get('limb_mapping', self.limb_mapping)
+        self.role_mapping = payload.get('role_mapping', self.role_mapping)
+        self.vocab_size = (len(self.hold_mapping) * len(self.limb_mapping)) + 1
+        print(f"Loaded vocab from {path}. Vocab size: {self.vocab_size}")
 
     def _build_vocabulary(self, data):
         hold_counter = 1
@@ -253,11 +295,11 @@ class EarlyStopping:
             print(f"Restored model to best weights from epoch {self.stopped_epoch - self.patience}")
 
 class ClimbGenerator:
-    def __init__(self, json_file):
+    def __init__(self, json_file, vocab_path=None):
         print(f"Initializing ClimbGenerator")
         print(f"Data file: {json_file}")
         
-        self.dataset = ClimbDataset(json_file)
+        self.dataset = ClimbDataset(json_file, vocab_path=vocab_path)
         self.model = None
         self.climb_data = self._load_climb_data(json_file)
         self.role_mapping = {
