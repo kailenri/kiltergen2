@@ -10,6 +10,7 @@ from collections import defaultdict
 import matplotlib.pyplot as plt
 import random
 from torch.nn import functional as F
+from viz import plot_climb_sequence
 
 class ClimbDataset(Dataset):
     def __init__(self, json_file, max_sequence_length=50):
@@ -684,79 +685,28 @@ class ClimbGenerator:
         if not sequence:
             print("No sequence to visualize")
             return
-        
-        plt.figure(figsize=(10, 12))
-        
-        #Draw grid
-        plt.grid(True, linestyle='--', alpha=0.6)
-        
-        # Get all holds for this climb
-        all_holds = []
+
         if climb_id and climb_id in self.climb_data:
-            all_holds = [(h.get('hole_id'), h.get('x', 0), h.get('y', 0), h.get('role_id', -1))
-                         for h in self.climb_data[climb_id]['holds']]
+            holds = self.climb_data[climb_id]["holds"]
         else:
-            all_holds = [(h_id, info.get('x', 0), info.get('y', 0), info.get('role_id', -1))
-                         for h_id, info in self.dataset.hold_info.items()]
-        
-        # Draw all holds as gray circles
-        for hold_id, x, y, role_id in all_holds:
-            color = 'gray'
-            if role_id == 12:  # Start
-                color = 'blue'
-            elif role_id == 14:  # Finish
-                color = 'red'
-                
-            plt.scatter(x, y, color=color, alpha=0.3, s=50)
-        
-        # Draw sequence
-        colors = {'RH': 'red', 'LH': 'blue', 'RF': 'green', 'LF': 'purple'}
-        
-        for i, move in enumerate(sequence):
-            x, y = move.get('x', 0), move.get('y', 0)
-            
-            plt.scatter(x, y, color=colors.get(move['limb'], 'black'), s=100, zorder=10)
-            plt.text(x, y, f"{i+1}", fontsize=10, ha='center', va='center', 
-                   bbox=dict(facecolor='white', alpha=0.7, edgecolor='none'))
-        
-        # Connect holds with arrows
-        for i in range(1, len(sequence)):
-            prev_x, prev_y = sequence[i-1].get('x', 0), sequence[i-1].get('y', 0)
-            curr_x, curr_y = sequence[i].get('x', 0), sequence[i].get('y', 0)
-            
-            plt.arrow(prev_x, prev_y, curr_x-prev_x, curr_y-prev_y, 
-                    head_width=0.5, head_length=0.7, fc=colors.get(sequence[i]['limb'], 'gray'), 
-                    ec=colors.get(sequence[i]['limb'], 'gray'), alpha=0.6)
-        
-        # Add legend
-        limb_labels = [plt.Line2D([0], [0], marker='o', color='w', 
-                               markerfacecolor=color, markersize=10, label=limb)
-                     for limb, color in colors.items()]
-        
-        plt.legend(handles=limb_labels, loc='upper right')
-        
-        # Set labels and title
-        plt.xlabel('X Position')
-        plt.ylabel('Y Position')
-        plt.title('Climbing Sequence Visualization')
-        
-        # Add sequence statistics
-        stats = self._calculate_sequence_stats(sequence)
-        if stats:
-            stat_text = "\n".join([f"{k}: {v:.1f}" if isinstance(v, float) else f"{k}: {v}" 
-                                for k, v in stats.items()])
-            plt.figtext(0.02, 0.02, stat_text, fontsize=10, 
-                      bbox=dict(facecolor='white', alpha=0.7, edgecolor='gray'))
-        
-        plt.tight_layout()
-        
-        if save_path:
-            plt.savefig(save_path)
-            print(f"Visualization saved to {save_path}")
-        else:
-            plt.show()
-            
-        plt.close()
+            holds = [
+                {
+                    "hole_id": h_id,
+                    "x": info.get("x", 0),
+                    "y": info.get("y", 0),
+                    "role_id": info.get("role_id", -1),
+                    "name": info.get("name", ""),
+                }
+                for h_id, info in self.dataset.hold_info.items()
+            ]
+
+        plot_climb_sequence(
+            holds,
+            sequence,
+            title="Climbing Sequence Visualization",
+            output_path=save_path,
+            show=save_path is None,
+        )
         
     def _calculate_sequence_stats(self, sequence):
         if not sequence:

@@ -2,13 +2,11 @@ import os
 import sys
 import argparse
 import json
-import torch
 import random
-import numpy as np
-import matplotlib.pyplot as plt
 from datetime import datetime
 from collections import defaultdict
-from lstm import ClimbGenerator, ClimbLSTM
+from lstm import ClimbGenerator
+from viz import plot_climb_sequence, plot_reachability_map, plot_hold_density
 
 class ClimbCreator:
     def __init__(self, model_path, data_file):
@@ -267,106 +265,24 @@ class ClimbCreator:
         return sequence
     
     def visualize_climb(self, climb, save_path=None):
-        if not climb or 'best_sequence' not in climb:
+        if not climb or "best_sequence" not in climb:
             print("Invalid climb data")
             return
-            
-        holds = climb['best_sequence'].get('holds', [])
-        sequence = climb['best_sequence'].get('sequence', [])
-        
+
+        holds = climb["best_sequence"].get("holds", [])
+        sequence = climb["best_sequence"].get("sequence", [])
+
         if not holds or not sequence:
             print("Climb has no holds or sequence")
             return
-        
-        plt.figure(figsize=(10, 12))
-        
-        # Draw grid
-        plt.grid(True, linestyle='--', alpha=0.6)
-        
-        # Draw all holds
-        for hold in holds:
-            x, y = hold.get('x', 0), hold.get('y', 0)
-            role_id = hold.get('role_id', 13)
-            name = hold.get('name', '')
-            
-            color = 'gray'
-            if role_id == 12:  # Start
-                color = 'blue'
-            elif role_id == 14:  # Finish
-                color = 'red'
-            elif role_id == 15:  # Foot
-                color = 'green'
-                
-            plt.scatter(x, y, color=color, alpha=0.5, s=80 if role_id != 15 else 50)
-            
-            # Add hold name or ID
-            label = name if name else f"{hold.get('hole_id', '')}"
-            plt.text(x, y - 2, label, fontsize=6, ha='center', alpha=0.7)
-        
-        # Draw sequence
-        colors = {'RH': 'red', 'LH': 'blue', 'RF': 'green', 'LF': 'purple'}
-        
-        # Create hold ID to hold mapping
-        hold_map = {hold.get('hole_id'): hold for hold in holds if 'hole_id' in hold}
-        
-        # Draw the sequence path
-        sequence_holds = []
-        for i, move in enumerate(sequence):
-            hold_id = move.get('hold')
-            limb = move.get('limb', 'RH')
-            
-            if hold_id in hold_map:
-                hold = hold_map[hold_id]
-                x, y = hold.get('x', 0), hold.get('y', 0)
-                
-                plt.scatter(x, y, color=colors.get(limb, 'black'), s=100, zorder=10)
-                plt.text(x, y, f"{i+1}", fontsize=10, ha='center', va='center', 
-                       bbox=dict(facecolor='white', alpha=0.7, edgecolor='none'))
-                
-                sequence_holds.append((x, y, limb))
-        
-        # Connect holds with arrows
-        for i in range(1, len(sequence_holds)):
-            prev_x, prev_y, _ = sequence_holds[i-1]
-            curr_x, curr_y, curr_limb = sequence_holds[i]
-            
-            plt.arrow(prev_x, prev_y, curr_x-prev_x, curr_y-prev_y, 
-                    head_width=0.5, head_length=0.7, fc=colors.get(curr_limb, 'gray'), 
-                    ec=colors.get(curr_limb, 'gray'), alpha=0.6)
-        
-        # Add legend
-        limb_labels = [plt.Line2D([0], [0], marker='o', color='w', 
-                               markerfacecolor=color, markersize=10, label=limb)
-                     for limb, color in colors.items()]
-        
-        plt.legend(handles=limb_labels, loc='upper right')
-        
-        # Set labels and title
-        plt.xlabel('X Position')
-        plt.ylabel('Y Position')
-        plt.title(f"{climb.get('name', 'New Climb')} - {climb.get('difficulty', 'moderate')}")
-        
-        # Add info
-        info_text = (
-            f"Wall: {climb.get('wall_name', 'Unknown')}\n"
-            f"Difficulty: {climb.get('difficulty', 'moderate')}\n"
-            f"Moves: {len(sequence)}\n"
-            f"Start Holds: {len([h for h in holds if h.get('role_id') == 12])}\n"
-            f"Hand Holds: {len([h for h in holds if h.get('role_id') == 13])}\n"
-            f"Finish Holds: {len([h for h in holds if h.get('role_id') == 14])}"
+
+        plot_climb_sequence(
+            holds,
+            sequence,
+            title=f"{climb.get('name', 'New Climb')} - {climb.get('difficulty', 'moderate')}",
+            output_path=save_path,
+            show=save_path is None,
         )
-        plt.figtext(0.02, 0.02, info_text, fontsize=10, 
-                  bbox=dict(facecolor='white', alpha=0.7, edgecolor='gray'))
-        
-        plt.tight_layout()
-        
-        if save_path:
-            plt.savefig(save_path)
-            print(f"Visualization saved to {save_path}")
-        else:
-            plt.show()
-            
-        plt.close()
     
     def export_climbs(self, climbs, output_file="generated_climbs.json"):
         output = {"results": climbs}
@@ -422,6 +338,12 @@ if __name__ == "__main__":
     parser.add_argument("--output", default="generated_climbs.json", help="Output file path")
     parser.add_argument("--visualize", action="store_true", help="Visualize the generated routes")
     parser.add_argument("--output-dir", default="visualizations", help="Directory for visualizations")
+    parser.add_argument(
+        "--viz-type",
+        default="path",
+        choices=["path", "reachability-hand", "reachability-foot", "hold-density"],
+        help="Visualization type to generate",
+    )
     
     args = parser.parse_args()
     
@@ -453,5 +375,29 @@ if __name__ == "__main__":
     if args.visualize and climbs:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         for i, climb in enumerate(climbs):
-            save_path = os.path.join(args.output_dir, f"climb_{timestamp}_{i+1}.png")
-            creator.visualize_climb(climb, save_path)
+            suffix = args.viz_type.replace("-", "_")
+            save_path = os.path.join(args.output_dir, f"climb_{timestamp}_{i+1}_{suffix}.png")
+            holds = climb["best_sequence"].get("holds", [])
+            sequence = climb["best_sequence"].get("sequence", [])
+            if args.viz_type == "path":
+                creator.visualize_climb(climb, save_path)
+            elif args.viz_type == "reachability-hand":
+                plot_reachability_map(
+                    holds,
+                    mode="hand",
+                    output_path=save_path,
+                    title=f"Hand Reachability - {climb.get('name', 'Climb')}",
+                )
+            elif args.viz_type == "reachability-foot":
+                plot_reachability_map(
+                    holds,
+                    mode="foot",
+                    output_path=save_path,
+                    title=f"Foot Reachability - {climb.get('name', 'Climb')}",
+                )
+            elif args.viz_type == "hold-density":
+                plot_hold_density(
+                    holds,
+                    output_path=save_path,
+                    title=f"Hold Density - {climb.get('name', 'Climb')}",
+                )

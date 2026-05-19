@@ -9,6 +9,15 @@ from pathlib import Path
 
 from lstm import ClimbGenerator
 
+
+def init_generator(data_path, model_path=None):
+    generator = ClimbGenerator(data_path)
+    if model_path:
+        if not generator.load_model(model_path):
+            print("Failed to load model. Exiting.")
+            return None
+    return generator
+
 def setup_parser():
     parser = argparse.ArgumentParser(
         description="Train and generate climbing sequences using adapted LSTM model"
@@ -128,7 +137,7 @@ def setup_parser():
 def train_model(args):
     print(f"Starting training with data from: {args.data}")
     print(f"Training parameters: epochs={args.epochs}, batch_size={args.batch_size}, lr={args.learning_rate}")
-    generator = ClimbGenerator(args.data)
+    generator = init_generator(args.data)
     
     #train LSTM
     train_losses, val_losses = generator.train(
@@ -150,9 +159,8 @@ def generate_sequences(args):
     os.makedirs(args.output_dir, exist_ok=True)
     
     #Initialize generator and load model
-    generator = ClimbGenerator(args.data)
-    if not generator.load_model(args.model):
-        print("Failed to load model. Exiting.")
+    generator = init_generator(args.data, args.model)
+    if not generator:
         return
     
     #gen sequences
@@ -177,9 +185,8 @@ def visualize_sequences(args):
     os.makedirs(args.output_dir, exist_ok=True)
     
     #load model
-    generator = ClimbGenerator(args.data)
-    if not generator.load_model(args.model):
-        print("Failed to load model. Exiting.")
+    generator = init_generator(args.data, args.model)
+    if not generator:
         return
     
     #gen
