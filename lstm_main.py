@@ -157,6 +157,11 @@ def train_model(args):
     print(f"Training parameters: epochs={args.epochs}, batch_size={args.batch_size}, lr={args.learning_rate}")
     generator = init_generator(args.data, vocab_path=args.vocab)
     
+    # ensure output directory exists
+    out_dir = os.path.dirname(args.output)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+
     #train LSTM
     train_losses, val_losses = generator.train(
         num_epochs=args.epochs,
@@ -167,7 +172,19 @@ def train_model(args):
     
     print(f"Training complete. Model saved to {args.output}")
     print(f"Training loss history saved to training_history.png")
-    
+    # Save vocab alongside the model for reproducibility
+    try:
+        if args.vocab:
+            vocab_path = args.vocab
+        else:
+            base = os.path.splitext(args.output)[0]
+            vocab_path = f"{base}_vocab.json"
+
+        generator.dataset.save_vocab(vocab_path)
+        print(f"Saved vocabulary to {vocab_path}")
+    except Exception as e:
+        print(f"Warning: failed to save vocab: {e}")
+
     return generator
 
 def generate_sequences(args):

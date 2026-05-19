@@ -1,8 +1,14 @@
 #!/usr/bin/env python3
 import json
 import os
+import sys
 import argparse
 from tqdm import tqdm
+
+# allow running from scripts/ so imports find top-level modules
+ROOT = os.path.dirname(os.path.dirname(__file__))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
 
 from sequence_generator import ClimbSequenceGenerator
 
@@ -31,7 +37,7 @@ def export_training(input_file, output_file, per_climb=5, beam_width=6):
             continue
 
         cleaned = []
-        for seqobj in res.get('all_sequences', [])[:per_climb]:
+        for seq_i, seqobj in enumerate(res.get('all_sequences', [])[:per_climb]):
             seq = seqobj.get('sequence', [])
             if not seq:
                 continue
@@ -54,10 +60,16 @@ def export_training(input_file, output_file, per_climb=5, beam_width=6):
                 continue
 
             evaluation = gen.evaluate_sequence(seq)
-            cleaned.append({'sequence': seq, 'evaluation': evaluation})
-
-        if cleaned:
-            results.append({'climb_id': climb_id, 'name': name, 'holds': holds, 'sequences': cleaned})
+            # create a result entry per sequence so ClimbDataset can consume it
+            results.append({
+                'id': f"{climb_id}_gen_{seq_i}",
+                'name': name,
+                'best_sequence': {
+                    'holds': holds,
+                    'sequence': seq
+                },
+                'evaluation': evaluation
+            })
 
     out_dir = os.path.dirname(output_file)
     if out_dir:
