@@ -6,6 +6,7 @@ from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
 import matplotlib.pyplot as plt
+from matplotlib.widgets import Button
 
 from config import MAX_FOOT_REACH, MAX_HAND_REACH, X_SPACING
 
@@ -185,6 +186,80 @@ def plot_climb_sequence(
     plt.close()
 
 
+def plot_sequence_cycle(
+    holds: List[Dict],
+    sequence: List[Dict],
+    title: str,
+    output_path: Optional[str] = None,
+    show: bool = True,
+    annotate_holds: bool = True,
+):
+    """Interactive step-through viewer that highlights each move and active limb."""
+    if not holds or not sequence:
+        raise ValueError("Climb has no holds or sequence")
+
+    hold_map = _build_hold_map(holds)
+    points = _sequence_points(holds, sequence)
+
+    fig, ax = plt.subplots(figsize=(10, 12))
+    plt.subplots_adjust(bottom=0.12)
+    ax.grid(True, linestyle="--", alpha=0.6)
+
+    _draw_hold_scatter(holds, annotate=annotate_holds)
+
+    # plot static arrows and markers (faded)
+    arrows = []
+    markers = []
+    for i, (x, y, limb) in enumerate(points):
+        m = ax.scatter(x, y, color=LIMB_COLORS.get(limb, "black"), s=90, alpha=0.35, zorder=5)
+        markers.append(m)
+        if i > 0:
+            px, py, _ = points[i - 1]
+            arr = ax.arrow(px, py, x - px, y - py, head_width=0.3, head_length=0.4,
+                           fc=LIMB_COLORS.get(limb, "gray"), ec=LIMB_COLORS.get(limb, "gray"), alpha=0.25)
+            arrows.append(arr)
+
+    # highlight for current move
+    cur_marker = ax.scatter([], [], s=200, edgecolor='black', linewidth=1.2, zorder=15)
+    info_text = ax.text(0.02, 0.02, "", transform=ax.transAxes, fontsize=10,
+                        bbox=dict(facecolor="white", alpha=0.8))
+
+    idx = {'i': 0}
+
+    def update():
+        i = idx['i']
+        x, y, limb = points[i]
+        cur_marker.set_offsets([[x, y]])
+        cur_marker.set_facecolors([LIMB_COLORS.get(limb, 'black')])
+        ax.set_title(f"{title} — Move {i+1}/{len(points)} — {limb}")
+        info_text.set_text(f"Active limb: {limb}\nHold: {sequence[i].get('hold')}")
+        fig.canvas.draw_idle()
+
+    def prev(event):
+        idx['i'] = (idx['i'] - 1) % len(points)
+        update()
+
+    def nxt(event):
+        idx['i'] = (idx['i'] + 1) % len(points)
+        update()
+
+    axprev = plt.axes([0.3, 0.03, 0.12, 0.05])
+    axnext = plt.axes([0.5, 0.03, 0.12, 0.05])
+    bprev = Button(axprev, 'Previous')
+    bnext = Button(axnext, 'Next')
+    bprev.on_clicked(prev)
+    bnext.on_clicked(nxt)
+
+    update()
+
+    if output_path:
+        # For cycle view we still save a static first-frame snapshot
+        plt.savefig(output_path)
+    if show:
+        plt.show()
+    plt.close()
+
+
 def _compute_reachability_matrix(holds: List[Dict], mode: str) -> List[List[bool]]:
     coords = [(h.get("x", 0), h.get("y", 0)) for h in holds]
     n = len(holds)
@@ -323,6 +398,15 @@ def visualizeclimb(climb_data, climb_id, output_dir="climb_visualizations", viz_
                 title=f"{climb.get('name', 'Climb')} (ID: {climb_id})",
                 output_path=save_path,
             )
+        elif viz_type == "cycle":
+            # interactive cycle view (shows a GUI window)
+            plot_sequence_cycle(
+                holds,
+                sequence,
+                title=f"{climb.get('name', 'Climb')} (ID: {climb_id})",
+                output_path=None,
+                show=True,
+            )
         elif viz_type == "reachability-hand":
             plot_reachability_map(
                 holds,
@@ -362,7 +446,7 @@ def main():
     parser.add_argument(
         "--type",
         default="path",
-        choices=["path", "reachability-hand", "reachability-foot", "hold-density"],
+        choices=["path", "cycle", "reachability-hand", "reachability-foot", "hold-density"],
         help="Type of visualization to generate",
     )
     

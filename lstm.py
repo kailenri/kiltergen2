@@ -10,7 +10,7 @@ from collections import defaultdict
 import matplotlib.pyplot as plt
 import random
 from torch.nn import functional as F
-from viz import plot_climb_sequence
+from viz import plot_climb_sequence, plot_sequence_cycle, plot_reachability_map, plot_hold_density
 
 class ClimbDataset(Dataset):
     def __init__(self, json_file, max_sequence_length=50):
@@ -681,7 +681,7 @@ class ClimbGenerator:
         
         return alternated
 
-    def visualize_sequence(self, sequence, climb_id=None, save_path=None):
+    def visualize_sequence(self, sequence, climb_id=None, save_path=None, viz_type='path'):
         if not sequence:
             print("No sequence to visualize")
             return
@@ -700,13 +700,28 @@ class ClimbGenerator:
                 for h_id, info in self.dataset.hold_info.items()
             ]
 
-        plot_climb_sequence(
-            holds,
-            sequence,
-            title="Climbing Sequence Visualization",
-            output_path=save_path,
-            show=save_path is None,
-        )
+        if viz_type == 'path':
+            plot_climb_sequence(
+                holds,
+                sequence,
+                title="Climbing Sequence Visualization",
+                output_path=save_path,
+                show=save_path is None,
+            )
+        elif viz_type == 'cycle':
+            plot_sequence_cycle(
+                holds,
+                sequence,
+                title="Climbing Sequence Visualization",
+                output_path=None,
+                show=True,
+            )
+        elif viz_type == 'reachability-hand':
+            plot_reachability_map(holds, mode='hand', output_path=save_path, title="Hand Reachability", show=save_path is None)
+        elif viz_type == 'reachability-foot':
+            plot_reachability_map(holds, mode='foot', output_path=save_path, title="Foot Reachability", show=save_path is None)
+        elif viz_type == 'hold-density':
+            plot_hold_density(holds, output_path=save_path, title="Hold Density", show=save_path is None)
         
     def _calculate_sequence_stats(self, sequence):
         if not sequence:

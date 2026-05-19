@@ -23,8 +23,8 @@ class ClimbSequenceGenerator:
         self.start_holds = [h for h in holds_data if h['role_id'] == 12]
         self.finish_holds = [h for h in holds_data if h['role_id'] == 14]
         self.hand_holds = [h for h in holds_data if h['role_id'] in {12, 13, 14}]
-        # Include all holds that feet can use
-        self.foot_holds = [h for h in holds_data if h['role_id'] in {12, 13, 14, 15}]
+        # Feet may use any hold
+        self.foot_holds = list(holds_data)
 
         if not self.start_holds or not self.finish_holds:
             raise ValueError("Missing essential start or finish holds")
@@ -164,115 +164,136 @@ class ClimbSequenceGenerator:
         return True
 
     def evaluate_sequence(self, sequence: List[Dict]) -> Dict:
-        """Evaluate a climbing sequence based on multiple metrics"""
+        """Evaluate a climbing sequence using additional stability metrics.
+
+        Adds `triangular_support` and `hand_support` metrics, strengthens
+        cross penalties, and normalizes scores by hand moves so beam
+        search prefers stable hand-centric sequences.
+        """
         if not sequence:
             return {'score': 0, 'details': {}}
 
         metrics = {
-            'hold_quality': 0,
-            'movement_efficiency': 0,
-            'limb_alternation': 0,
-            'body_position': 0,
-            'cross_prevention': 0,
-            'completion': 0
+            'hold_quality': 0.0,
+            'movement_efficiency': 0.0,
+            'limb_alternation': 0.0,
+            'body_position': 0.0,
+            'cross_prevention': 0.0,
+            'triangular_support': 0.0,
+            'hand_support': 0.0,
+            'completion': 0.0,
         }
-        
+
         limb_use = defaultdict(int)
         prev_limb = None
-        limb_positions = {
-            'RH': None, 'LH': None,
-            'RF': None, 'LF': None
-        }
+        limb_positions = {'RH': None, 'LH': None, 'RF': None, 'LF': None}
 
         for i, move in enumerate(sequence):
-            hold = self.hold_dict[move['hold']]
+            hold = self.hold_dict.get(move['hold'])
+            if not hold:
+                continue
             limb = move['limb']
             limb_positions[limb] = (hold['x'], hold['y'])
-            
-            #quality scoring
-            if hold['role_id'] == 14:  
+
+            # hold quality
+            if hold['role_id'] == 14:
                 metrics['hold_quality'] += 10
-            elif hold['role_id'] == 12:  
+            elif hold['role_id'] == 12:
                 metrics['hold_quality'] += 5
-            else:  # Regular hold
+            else:
                 metrics['hold_quality'] += 1
 
-            #reward shorter moves - efficiency 
+            # movement efficiency (shorter moves preferred)
             if i > 0:
-                prev_hold = self.hold_dict[sequence[i-1]['hold']]
-                dist = math.hypot(hold['x']-prev_hold['x'], hold['y']-prev_hold['y'])
-                # Give higher scores for more efficient movements
-                metrics['movement_efficiency'] += 1/(dist + 0.1)
+                prev_hold = self.hold_dict.get(sequence[i - 1]['hold'])
+                if prev_hold:
+                    dist = math.hypot(hold['x'] - prev_hold['x'], hold['y'] - prev_hold['y'])
+                    metrics['movement_efficiency'] += 1.0 / (dist + 0.1)
 
-            #reward alternating limbs
-            if limb in ['RH', 'LH'] and prev_limb in ['RH', 'LH'] and limb != prev_limb:
+            # limb alternation for hands
+            if limb in ('RH', 'LH') and prev_limb in ('RH', 'LH') and limb != prev_limb:
                 metrics['limb_alternation'] += 1
-            
-            #penalize crossed arms or legs
-            if all(pos is not None for pos in [limb_positions['RH'], limb_positions['LH']]):
-                if limb_positions['RH'][0] < limb_positions['LH'][0]:  # RH is left of LH (crossed)
-                    metrics['cross_prevention'] -= 5
-            
-            if all(pos is not None for pos in [limb_positions['RF'], limb_positions['LF']]):
-                if limb_positions['RF'][0] < limb_positions['LF'][0]:  # RF is left of LF (crossed)
-                    metrics['cross_prevention'] -= 3
-            
-            #reward stable triangular positions
-            if all(pos is not None for pos in [limb_positions['RH'], limb_positions['LH'], 
-                                             limb_positions['RF'], limb_positions['LF']]):
-                #calc center of gravity
-                cog_x = sum(pos[0] for pos in limb_positions.values())/4
-                cog_y = sum(pos[1] for pos in limb_positions.values())/4
-                
-                #check if COG is within the support polygon
+
+            # stronger crossing penalties
+            if limb_positions['RH'] is not None and limb_positions['LH'] is not None:
+                if limb_positions['RH'][0] < limb_positions['LH'][0]:
+                    metrics['cross_prevention'] -= 8
+
+            if limb_positions['RF'] is not None and limb_positions['LF'] is not None:
+                if limb_positions['RF'][0] < limb_positions['LF'][0]:
+                    metrics['cross_prevention'] -= 4
+
+            # triangular support: reward having 3+ limbs on holds
+            filled = [p for p in limb_positions.values() if p is not None]
+            if len(filled) >= 3:
+                metrics['triangular_support'] += len(filled) - 2
+
+            # hand_support: when a hand reaches, check complementary limbs
+            if limb == 'LH':
+                # LH reach: ideally RH and LF are planted
+                if limb_positions['RH'] is not None and limb_positions['LF'] is not None:
+                    metrics['hand_support'] += 1
+                else:
+                    metrics['hand_support'] -= 1
+            if limb == 'RH':
+                # RH reach: ideally LH and RF are planted
+                if limb_positions['LH'] is not None and limb_positions['RF'] is not None:
+                    metrics['hand_support'] += 1
+                else:
+                    metrics['hand_support'] -= 1
+
+            # body position: hands above feet and COG inside foot span
+            if limb_positions['RF'] is not None and limb_positions['LF'] is not None and limb_positions['RH'] is not None and limb_positions['LH'] is not None:
+                cog_x = sum(p[0] for p in limb_positions.values()) / 4.0
                 min_foot_x = min(limb_positions['RF'][0], limb_positions['LF'][0])
                 max_foot_x = max(limb_positions['RF'][0], limb_positions['LF'][0])
-                
                 if min_foot_x <= cog_x <= max_foot_x:
-                    metrics['body_position'] += 2  #stable
-                else:
-                    metrics['body_position'] += 0.5  #less stable
-                    
-                #rewards hands being higher than feet
+                    metrics['body_position'] += 2
+                # hands higher than feet
                 if min(limb_positions['RH'][1], limb_positions['LH'][1]) > max(limb_positions['RF'][1], limb_positions['LF'][1]):
                     metrics['body_position'] += 1
-                    
+
             prev_limb = limb
             limb_use[limb] += 1
 
-        #bonus for completion
+        # completion bonus: last move on a finish hold
         last_move = sequence[-1]
-        metrics['completion'] = 10 if self.hold_dict[last_move['hold']]['role_id'] == 14 else 0
+        metrics['completion'] = 10.0 if self.hold_dict.get(last_move['hold'], {}).get('role_id') == 14 else 0.0
 
-        #norm
+        # normalize metrics
         seq_len = len(sequence)
         if seq_len > 1:
             metrics['movement_efficiency'] /= (seq_len - 1)
-        
-        hand_moves = sum(1 for m in sequence if m['limb'] in ['RH', 'LH'])
-        if hand_moves > 1:
-            metrics['limb_alternation'] /= (hand_moves - 1)
-            
-        #normalize
-        metrics['cross_prevention'] = max(0, metrics['cross_prevention'] + 5)
 
-        #adding weights
+        hand_moves = sum(1 for m in sequence if m['limb'] in ('RH', 'LH'))
+        if hand_moves > 1:
+            metrics['limb_alternation'] /= max(1, (hand_moves - 1))
+
+        # keep cross_prevention non-negative (higher is better)
+        metrics['cross_prevention'] = max(0.0, metrics['cross_prevention'] + 8.0)
+
+        # assemble weights
         weights = {
-            'hold_quality': 0.15,
-            'movement_efficiency': 0.20,
-            'limb_alternation': 0.20,
-            'body_position': 0.15,
-            'cross_prevention': 0.20,
-            'completion': 0.10
+            'hold_quality': 0.12,
+            'movement_efficiency': 0.16,
+            'limb_alternation': 0.15,
+            'body_position': 0.12,
+            'cross_prevention': 0.12,
+            'triangular_support': 0.12,
+            'hand_support': 0.11,
+            'completion': 0.10,
         }
 
-        total_score = sum(metrics[k]*weights[k] for k in metrics)
+        total_score = 0.0
+        for k, v in metrics.items():
+            w = weights.get(k, 0.0)
+            total_score += v * w
 
         return {
             'score': total_score,
             'details': metrics,
             'limb_balance': dict(limb_use),
-            'sequence_length': seq_len
+            'sequence_length': seq_len,
         }
 
     def generate_sequences(self, beam_width: int = None) -> Dict[str, Any]:
@@ -477,8 +498,21 @@ class ClimbSequenceGenerator:
 
     def _is_complete(self, state):
         limbs = state['limbs']
-        return (limbs['RH'] and limbs['RH']['role_id'] == 14) or \
-               (limbs['LH'] and limbs['LH']['role_id'] == 14)
+        # Finish is determined only by hands occupying finish holds
+        finish_ids = {h['hole_id'] for h in self.finish_holds}
+        hand_ids = {limbs['RH']['hole_id'] if limbs['RH'] else None,
+                    limbs['LH']['hole_id'] if limbs['LH'] else None}
+        hand_ids.discard(None)
+
+        if not finish_ids:
+            return False
+
+        # Single finish: at least one hand on it
+        if len(finish_ids) == 1:
+            return any(h in finish_ids for h in hand_ids)
+
+        # Multiple finishes: require hands to cover all finish holds
+        return finish_ids.issubset(hand_ids)
 
     def _setup_timing(self):
         self.timers = {}

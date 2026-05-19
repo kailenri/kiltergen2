@@ -1,0 +1,10 @@
+numpy
+matplotlib
+tqdm
+scikit-learn
+# For model training and inference - install the correct wheel for your platform
+# Recommended: follow PyTorch install instructions at https://pytorch.org
+torch
+
+# Optional utilities
+jsonschema

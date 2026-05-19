@@ -131,6 +131,12 @@ def setup_parser():
         default="visualizations", 
         help="Directory to save visualizations"
     )
+    vis_parser.add_argument(
+        "--viz-type",
+        default="path",
+        choices=["path", "cycle", "reachability-hand", "reachability-foot", "hold-density"],
+        help="Type of visualization to generate",
+    )
     
     return parser
 
@@ -212,7 +218,8 @@ def visualize_sequences(args):
         generator.visualize_sequence(
             sequence=seq['sequence'],
             climb_id=seq['climb_id'],
-            save_path=filename
+            save_path=filename,
+            viz_type=args.viz_type
         )
         print(f"Visualization {i+1} saved to {filename}")
     
