@@ -56,6 +56,20 @@ def setup_parser():
         "--vocab",
         help="Path to vocab.json to load or save",
     )
+    train_parser.add_argument(
+        "--checkpoint-dir",
+        help="Directory to write intermediate checkpoints",
+    )
+    train_parser.add_argument(
+        "--checkpoint-freq",
+        type=int,
+        default=5,
+        help="Save checkpoint every N epochs",
+    )
+    train_parser.add_argument(
+        "--logdir",
+        help="TensorBoard log directory",
+    )
     
 
     gen_parser = subparsers.add_parser("generate", help="Generate climbing sequences")
@@ -167,7 +181,10 @@ def train_model(args):
         num_epochs=args.epochs,
         batch_size=args.batch_size,
         learning_rate=args.learning_rate,
-        save_path=args.output
+        save_path=args.output,
+        checkpoint_dir=args.checkpoint_dir,
+        checkpoint_freq=args.checkpoint_freq,
+        log_dir=args.logdir
     )
     
     print(f"Training complete. Model saved to {args.output}")

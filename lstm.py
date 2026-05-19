@@ -11,6 +11,8 @@ import matplotlib.pyplot as plt
 import random
 from torch.nn import functional as F
 from viz import plot_climb_sequence, plot_sequence_cycle, plot_reachability_map, plot_hold_density
+from torch.utils.tensorboard import SummaryWriter
+import os
 
 class ClimbDataset(Dataset):
     def __init__(self, json_file, max_sequence_length=50, vocab_path=None):
@@ -350,7 +352,7 @@ class ClimbGenerator:
             print(f"Error loading model: {e}")
             return False
 
-    def train(self, num_epochs=30, batch_size=32, learning_rate=0.001, save_path='lstm_model.pth'):
+    def train(self, num_epochs=30, batch_size=32, learning_rate=0.001, save_path='lstm_model.pth', checkpoint_dir=None, checkpoint_freq=5, log_dir=None):
         train_data, val_data = train_test_split(self.dataset, test_size=0.2, random_state=42, shuffle=True)
         
         #Set up data loaders
@@ -381,15 +383,25 @@ class ClimbGenerator:
         )
         
         early_stopping = EarlyStopping(patience=7, restore_best_weights=True)
+
+        # Setup TensorBoard SummaryWriter if requested
+        writer = None
+        if log_dir:
+            os.makedirs(log_dir, exist_ok=True)
+            writer = SummaryWriter(log_dir)
+
+        # Ensure checkpoint directory exists
+        if checkpoint_dir:
+            os.makedirs(checkpoint_dir, exist_ok=True)
         
         #Training loop
         train_losses, val_losses = [], []
         
-        for epoch in range(num_epochs):
+            for epoch in range(1, num_epochs + 1):
             self.model.train()
             epoch_loss = 0
             
-            progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}")
+                progress_bar = tqdm(train_loader, desc=f"Epoch {epoch}/{num_epochs}")
             for inputs, targets in progress_bar:
                 inputs, targets = inputs.to(device), targets.to(device)
                 
@@ -414,20 +426,35 @@ class ClimbGenerator:
             
             #validation
             val_loss = self._evaluate(val_loader, criterion, device)
+
+            # TensorBoard logging
+            if writer is not None:
+                writer.add_scalar('train/loss', epoch_loss / max(1, len(train_loader)), epoch)
+                writer.add_scalar('val/loss', val_loss / max(1, len(val_loader)), epoch)
             
             #Log metrics
-            avg_train_loss = epoch_loss / len(train_loader)
-            avg_val_loss = val_loss / len(val_loader)
+            avg_train_loss = epoch_loss / max(1, len(train_loader))
+            avg_val_loss = val_loss / max(1, len(val_loader))
             train_losses.append(avg_train_loss)
             val_losses.append(avg_val_loss)
             
-            print(f"Epoch {epoch+1}: Train Loss={avg_train_loss:.4f}, Val Loss={avg_val_loss:.4f}")
+            print(f"Epoch {epoch}: Train Loss={avg_train_loss:.4f}, Val Loss={avg_val_loss:.4f}")
             
             #Check for early stopping
             if early_stopping(avg_val_loss, self.model):
-                print(f"Early stopping triggered at epoch {epoch+1}")
+                print(f"Early stopping triggered at epoch {epoch}")
                 early_stopping.restore_weights(self.model)
                 break
+
+            # Checkpointing: save intermediate model and vocab
+            if checkpoint_dir and (epoch % checkpoint_freq == 0):
+                ckpt_path = os.path.join(checkpoint_dir, f"checkpoint_epoch{epoch}.pth")
+                torch.save({'epoch': epoch, 'model_state_dict': self.model.state_dict(), 'optimizer_state_dict': optimizer.state_dict()}, ckpt_path)
+                try:
+                    vocab_path = os.path.join(checkpoint_dir, f"vocab_epoch{epoch}.json")
+                    self.dataset.save_vocab(vocab_path)
+                except Exception:
+                    pass
             
             #Generate a sample sequence every 5 epochs
             if (epoch + 1) % 5 == 0:
