@@ -58,17 +58,17 @@ def setup_parser():
     )
     train_parser.add_argument(
         "--checkpoint-dir",
-        help="Directory to write intermediate checkpoints",
+        help="Directory to save checkpoints (optional)",
     )
     train_parser.add_argument(
         "--checkpoint-freq",
         type=int,
         default=5,
-        help="Save checkpoint every N epochs",
+        help="Save a checkpoint every N epochs",
     )
     train_parser.add_argument(
-        "--logdir",
-        help="TensorBoard log directory",
+        "--tb-logdir",
+        help="TensorBoard log directory (optional)",
     )
     
 
@@ -184,7 +184,7 @@ def train_model(args):
         save_path=args.output,
         checkpoint_dir=args.checkpoint_dir,
         checkpoint_freq=args.checkpoint_freq,
-        log_dir=args.logdir
+        tb_logdir=args.tb_logdir
     )
     
     print(f"Training complete. Model saved to {args.output}")
