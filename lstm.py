@@ -34,6 +34,7 @@ class ClimbDataset(Dataset):
             self.load_vocab(vocab_path)
         else:
             self._build_vocabulary(data)
+        self._populate_hold_info(data)
         self._create_sequences(data)
         self.augment_sequences()
         
@@ -94,20 +95,65 @@ class ClimbDataset(Dataset):
                     self.reverse_hold_mapping[hold_counter] = hold_id
                     hold_counter += 1
 
-            #Add hold information (coordinates, roles)
+        print(f"Built vocabulary with {len(self.hold_mapping)} holds")
+
+    def _populate_hold_info(self, data):
+        """Populate hold spatial info (x, y, role_id) from the data file.
+        Called after vocab is built or loaded so it works in both paths.
+        """
+        for result in data['results']:
+            if 'best_sequence' not in result:
+                continue
             for h in result['best_sequence'].get('holds', []):
                 hold_id = h.get('hole_id')
-                if hold_id:
+                if hold_id and hold_id not in self.hold_info:
                     self.hold_info[hold_id] = {
                         'x': h.get('x', 0),
                         'y': h.get('y', 0),
-                        'role_id': h.get('role_id', 13),  #Default to hand hold
+                        'role_id': h.get('role_id', 13),
                         'name': h.get('name', ''),
                         'climb_id': result.get('id', '')
                     }
-        
-        print(f"Built vocabulary with {len(self.hold_mapping)} holds")
-        print(f"Loaded information for {len(self.hold_info)} holds")
+        print(f"Loaded spatial info for {len(self.hold_info)} holds")
+
+    def build_spatial_features(self):
+        """Build a (vocab_size, 10) float tensor of per-token spatial features:
+          [x_norm, y_norm, role_start, role_hand, role_finish, role_foot,
+           limb_RH, limb_LH, limb_RF, limb_LF]
+        Token 0 (PAD) is all zeros.  Returns None if hold_info is empty.
+        """
+        if not self.hold_info:
+            return None
+
+        x_vals = [info['x'] for info in self.hold_info.values()]
+        y_vals = [info['y'] for info in self.hold_info.values()]
+        x_min, x_max = min(x_vals), max(x_vals)
+        y_min, y_max = min(y_vals), max(y_vals)
+        x_range = (x_max - x_min) or 1.0
+        y_range = (y_max - y_min) or 1.0
+
+        role_order = [12, 13, 14, 15]   # Start, Hand, Finish, Foot
+        limb_order = [0, 1, 2, 3]       # RH, LH, RF, LF
+        n_limbs = len(self.limb_mapping)
+
+        features = torch.zeros(self.vocab_size, 10)
+
+        for hold_id, hold_token in self.hold_mapping.items():
+            if hold_id == 'PAD':
+                continue
+            info = self.hold_info.get(hold_id, {})
+            x_norm = (info.get('x', x_min) - x_min) / x_range
+            y_norm = (info.get('y', y_min) - y_min) / y_range
+            role_id = info.get('role_id', 13)
+            role_oh = [float(role_id == r) for r in role_order]
+            for limb_token in limb_order:
+                token_id = (hold_token * n_limbs) + limb_token + 1
+                if 0 < token_id < self.vocab_size:
+                    limb_oh = [float(limb_token == lt) for lt in limb_order]
+                    features[token_id] = torch.tensor([x_norm, y_norm] + role_oh + limb_oh)
+
+        print(f"Built spatial feature tensor: {features.shape}")
+        return features
 
     def _create_sequences(self, data):
         total_sequences = valid_sequences = 0
@@ -143,49 +189,81 @@ class ClimbDataset(Dataset):
     def augment_sequences(self):
         original_count = len(self.sequences)
         new_sequences = []
-        
-        #mirroring technique
+
+        # --- Build spatial mirror lookup for spatially-correct mirroring ---
+        # Mirror: limb L↔R AND hold position flipped about the wall's centre X.
+        x_vals = [info['x'] for info in self.hold_info.values() if 'x' in info]
+        wall_center_x = (min(x_vals) + max(x_vals)) / 2.0 if x_vals else None
+
+        # (x, y) → hold_token  and  hold_token → (x, y)
+        xy_to_token: dict = {}
+        token_to_xy: dict = {}
+        for hold_id, info in self.hold_info.items():
+            token = self.hold_mapping.get(hold_id)
+            if token is not None:
+                xy = (info.get('x', 0), info.get('y', 0))
+                xy_to_token[xy] = token
+                token_to_xy[token] = xy
+
+        def mirror_hold_token(hold_token):
+            """Return the hold_token at the spatially mirrored position, or None."""
+            if wall_center_x is None:
+                return hold_token  # no spatial data; keep as-is
+            xy = token_to_xy.get(hold_token)
+            if xy is None:
+                return None
+            mirror_xy = (2.0 * wall_center_x - xy[0], xy[1])
+            return xy_to_token.get(mirror_xy)  # None if no mirror hold exists
+
+        # --- Spatially-correct mirroring ---
+        # Swap L↔R limbs AND remap each hold to its mirrored counterpart.
+        # Skip any sequence whose holds lack a mirror partner in the vocab.
+        n_limbs = len(self.limb_mapping)
         for seq in self.sequences[:original_count]:
             mirrored = []
+            valid = True
             for token in seq:
-                if token == 0:  #Padding
+                if token == 0:  # Padding
                     mirrored.append(0)
                     continue
-                    
                 token -= 1
-                hold_token = token // len(self.limb_mapping)
-                limb_token = token % len(self.limb_mapping)
-                
-                #Swap left and right limbs
-                if limb_token in [self.limb_mapping['LH'], self.limb_mapping['RH']]:
-                    limb_token = 1 - limb_token  #Swap RH(0) and LH(1)
-                elif limb_token in [self.limb_mapping['LF'], self.limb_mapping['RF']]:
-                    limb_token = 5 - limb_token  #Swap LF(2) and RF(3)
-                    
-                new_token = (hold_token * len(self.limb_mapping)) + limb_token + 1
+                hold_token = token // n_limbs
+                limb_token = token % n_limbs
+
+                m_hold_token = mirror_hold_token(hold_token)
+                if m_hold_token is None:
+                    valid = False
+                    break
+
+                # Swap left ↔ right limbs
+                if limb_token in (self.limb_mapping['LH'], self.limb_mapping['RH']):
+                    limb_token = 1 - limb_token          # RH(0) ↔ LH(1)
+                elif limb_token in (self.limb_mapping['RF'], self.limb_mapping['LF']):
+                    limb_token = 5 - limb_token          # RF(2) ↔ LF(3)
+
+                new_token = (m_hold_token * n_limbs) + limb_token + 1
                 mirrored.append(new_token)
-            new_sequences.append(mirrored)
-        
-        #Subsequence creation
+
+            if valid:
+                new_sequences.append(mirrored)
+
+        # --- Subsequence creation: valid prefixes only ---
+        # Only keep the first half so every sub-sequence starts from the beginning
+        # with known limb positions. The second half (mid-sequence onwards) is
+        # omitted because it would start with unknown limb context.
         min_subseq_length = 8
         for seq in self.sequences[:original_count]:
             actual_seq = [t for t in seq if t != 0]
             if len(actual_seq) >= min_subseq_length * 2:
-                mid_point = len(actual_seq) // 2
-                for half in [actual_seq[:mid_point], actual_seq[mid_point:]]:
-                    if len(half) >= min_subseq_length:
-                        new_sequences.append(half + [0] * (self.max_sequence_length - len(half)))
-        
-        #jitter
-        jitter_prob = 0.1
-        for seq in self.sequences[:original_count]:
-            if seq.count(0) <= len(seq) * 0.5:  # Skip mostly padded sequences
-                valid_tokens = list(set(t for t in seq if t != 0))
-                if valid_tokens:
-                    jittered = [t if random.random() > jitter_prob else random.choice(valid_tokens) 
-                               for t in seq]
-                    new_sequences.append(jittered)
-        
+                first_half = actual_seq[:len(actual_seq) // 2]
+                if len(first_half) >= min_subseq_length:
+                    padded = first_half + [0] * (self.max_sequence_length - len(first_half))
+                    new_sequences.append(padded)
+
+        # Jitter augmentation removed: randomly replacing tokens with arbitrary
+        # tokens from the same climb ignores ordering constraints and produces
+        # physically invalid transitions that pollute the training distribution.
+
         self.sequences.extend(new_sequences)
         print(f"Augmented dataset from {original_count} to {len(self.sequences)} sequences")
 
@@ -237,36 +315,59 @@ class FocalLoss(nn.Module):
         return ((1 - pt) ** self.gamma * ce_loss).mean()
 
 class ClimbLSTM(nn.Module):
-    def __init__(self, vocab_size, embedding_dim=128, hidden_dim=256, num_layers=2, dropout=0.2):
+    def __init__(self, vocab_size, embedding_dim=128, hidden_dim=256, num_layers=2, dropout=0.2,
+                 spatial_features=None, spatial_proj_dim=32):
         super().__init__()
         self.embedding = nn.Embedding(vocab_size, embedding_dim, padding_idx=0)
+
+        # Optional spatial feature branch: projects per-token [x, y, role, limb]
+        # features into a compact embedding concatenated with the token embedding.
+        # Using a registered buffer so it is saved/restored with the model but
+        # not updated by the optimiser.
+        lstm_input_dim = embedding_dim
+        if spatial_features is not None:
+            self.register_buffer('spatial_features', spatial_features)
+            self.spatial_proj = nn.Sequential(
+                nn.Linear(spatial_features.shape[1], spatial_proj_dim),
+                nn.ReLU(),
+            )
+            lstm_input_dim = embedding_dim + spatial_proj_dim
+        else:
+            self.spatial_features = None
+            self.spatial_proj = None
+
         self.lstm = nn.LSTM(
-            embedding_dim, hidden_dim, 
+            lstm_input_dim, hidden_dim,
             num_layers=num_layers,
-            batch_first=True, 
+            batch_first=True,
             dropout=dropout if num_layers > 1 else 0
         )
-        self.bn = nn.BatchNorm1d(hidden_dim)
+        # LayerNorm is correct for sequence models: it normalises per time-step
+        # using statistics from that step alone, so batch-size=1 inference
+        # behaves identically to batch training (unlike BatchNorm1d).
+        self.layer_norm = nn.LayerNorm(hidden_dim)
+        self.dropout = nn.Dropout(dropout)
         self.fc = nn.Linear(hidden_dim, vocab_size)
         self._init_weights()
-        
+
     def _init_weights(self):
         init_range = 0.1
         self.embedding.weight.data.uniform_(-init_range, init_range)
         self.fc.weight.data.uniform_(-init_range, init_range)
         self.fc.bias.data.zero_()
-        
+
     def forward(self, x, hidden=None):
-        batch_size, seq_len = x.size()
         embedded = self.embedding(x)
+
+        if self.spatial_features is not None and self.spatial_proj is not None:
+            # x: (batch, seq_len) — index directly into the buffer
+            spatial_raw = self.spatial_features[x]          # (batch, seq_len, feat_dim)
+            spatial_emb = self.spatial_proj(spatial_raw)    # (batch, seq_len, proj_dim)
+            embedded = torch.cat([embedded, spatial_emb], dim=-1)
+
         lstm_out, hidden = self.lstm(embedded, hidden)
-        
-        # Apply batch norm
-        reshaped = lstm_out.contiguous().view(-1, lstm_out.size(-1))
-        normalized = self.bn(reshaped)
-        reshaped = normalized.view(batch_size, seq_len, -1)
-        
-        return self.fc(reshaped), hidden
+        out = self.dropout(self.layer_norm(lstm_out))
+        return self.fc(out), hidden
 
 class EarlyStopping:
     def __init__(self, patience=7, min_delta=0.001, restore_best_weights=True):
@@ -347,7 +448,8 @@ class ClimbGenerator:
                 embedding_dim=128,
                 hidden_dim=256,
                 num_layers=2,
-                dropout=0.2
+                dropout=0.2,
+                spatial_features=self.dataset.build_spatial_features(),
             ).to(device)
             
             state_dict = torch.load(model_path, map_location=device)
@@ -382,7 +484,8 @@ class ClimbGenerator:
             embedding_dim=128,
             hidden_dim=256,
             num_layers=2,
-            dropout=0.2
+            dropout=0.2,
+            spatial_features=self.dataset.build_spatial_features(),
         ).to(device)
         
         #Set up loss, optimizer and schedulers
@@ -422,10 +525,13 @@ class ClimbGenerator:
             for inputs, targets in progress_bar:
                 inputs, targets = inputs.to(device), targets.to(device)
                 
-                #Skip batch if it contains invalid tokens
+                #Raise on invalid tokens — catches data pipeline bugs early
                 if (inputs >= self.dataset.vocab_size).any() or (targets >= self.dataset.vocab_size).any():
-                    print("Skipping batch with invalid token IDs")
-                    continue
+                    raise ValueError(
+                        f"Invalid token ID found in training batch "
+                        f"(vocab_size={self.dataset.vocab_size}). "
+                        "Re-build vocabulary or re-export training data."
+                    )
                 
                 optimizer.zero_grad()
                 outputs, _ = self.model(inputs)
@@ -504,7 +610,7 @@ class ClimbGenerator:
             
             #Generate a sample sequence every 5 epochs
             if (epoch + 1) % 5 == 0:
-                self._generate_sample(device)
+                self._generate_sample(device, writer=writer, epoch=epoch + 1)
         
         #Ensure best weights are used
         if not early_stopping.stopped_epoch and early_stopping.best_weights is not None:
@@ -552,7 +658,11 @@ class ClimbGenerator:
                 
                 #Skip batch if it contains invalid tokens
                 if (inputs >= self.dataset.vocab_size).any() or (targets >= self.dataset.vocab_size).any():
-                    continue
+                    raise ValueError(
+                        f"Invalid token ID found in validation batch "
+                        f"(vocab_size={self.dataset.vocab_size}). "
+                        "Re-build vocabulary or re-export training data."
+                    )
                 
                 outputs, _ = self.model(inputs)
                 loss = criterion(outputs.reshape(-1, self.dataset.vocab_size), targets.reshape(-1))
@@ -560,7 +670,7 @@ class ClimbGenerator:
         
         return total_loss
 
-    def _generate_sample(self, device, temp=0.8):
+    def _generate_sample(self, device, temp=0.8, writer=None, epoch=None):
         self.model.eval()
         
         with torch.no_grad():
@@ -619,10 +729,27 @@ class ClimbGenerator:
                     
                     if len(decoded) > 10:
                         print(f"... and {len(decoded) - 10} more moves")
-                
+
+                    # Log quality metrics to TensorBoard when available
+                    if writer is not None and epoch is not None:
+                        hand_moves = [m for m in decoded if m.get('limb') in ('RH', 'LH')]
+                        has_finish = any(m.get('role_id') == 14 for m in decoded[-2:])
+                        coords = [(m.get('x', 0), m.get('y', 0)) for m in hand_moves]
+                        dists = [
+                            math.hypot(coords[i][0] - coords[i-1][0], coords[i][1] - coords[i-1][1])
+                            for i in range(1, len(coords))
+                        ]
+                        role_valid = sum(1 for m in hand_moves if m.get('role_id') in {12, 13, 14})
+                        writer.add_scalar('sample/validity_rate', float(has_finish), epoch)
+                        writer.add_scalar('sample/avg_hand_move_dist',
+                                          sum(dists) / len(dists) if dists else 0.0, epoch)
+                        writer.add_scalar('sample/hand_role_accuracy',
+                                          role_valid / len(hand_moves) if hand_moves else 0.0, epoch)
+                        writer.add_scalar('sample/seq_length', len(decoded), epoch)
+
             else:
                 print("\nNo climb data available for sample generation")
-        
+
         self.model.train()
 
     def _plot_training_history(self, train_losses, val_losses):
@@ -728,12 +855,26 @@ class ClimbGenerator:
                 if hold:
                     limb_positions[limb] = (hold.get('x', 0), hold.get('y', 0))
                     used_hold_ids.add(hold_id)
+
+            # Seed foot positions from the start holds so the kinematic model
+            # (_dynamic_hand_reachable) can compute hip/shoulder estimates
+            # immediately rather than falling back to the flat distance check.
+            if limb_positions['RF'] is None:
+                limb_positions['RF'] = limb_positions.get('RH') or limb_positions.get('LH')
+            if limb_positions['LF'] is None:
+                limb_positions['LF'] = limb_positions.get('LH') or limb_positions.get('RH')
             
             if not current_tokens:
                 print(f"Could not create start tokens for climb {current_id}")
                 continue
                 
             print(f"Using {len(current_tokens)} start tokens")
+            # Minimum moves that must be generated before the finish-seeker
+            # is allowed to terminate the sequence.  Without this guard the
+            # model can finish after just 1-2 hand moves whenever a finish
+            # hold happens to be reachable from the start position.
+            num_start_tokens = len(current_tokens)
+            min_moves_before_finish = num_start_tokens + 6
 
             rev_limb_mapping = {v: k for k, v in self.dataset.limb_mapping.items()}
             last_hand = None
@@ -758,63 +899,6 @@ class ClimbGenerator:
                     'name': hold.get('name', '')
                 }
 
-            def has_reachable_unused_hold(limb):
-                if limb in ('RH', 'LH') and last_hand == limb:
-                    return False
-                for hold in hold_map.values():
-                    if hold.get('role_id') not in {12, 13, 14} and limb in ('RH', 'LH'):
-                        continue
-                    hold_id = hold.get('hole_id')
-                    if hold_id in used_hold_ids and hold.get('role_id') != 14:
-                        continue
-                    if limb in ('RH', 'LH'):
-                        ok, _ = self._dynamic_hand_reachable(hold, limb, limb_positions)
-                        if not ok:
-                            continue
-                        max_reach = MAX_HAND_REACH
-                    else:
-                        max_reach = MAX_FOOT_REACH
-
-                    prev_pos = limb_positions.get(limb)
-                    if prev_pos is not None:
-                        dist = math.hypot(hold.get('x', 0) - prev_pos[0], hold.get('y', 0) - prev_pos[1])
-                        if dist > max_reach * 0.95:
-                            continue
-                    return True
-                return False
-
-            def is_reachable_move(move):
-                if not move:
-                    return False
-                limb = move.get('limb')
-                hold = hold_map.get(move.get('hold'))
-                if not hold:
-                    return False
-                if move.get('hold') in used_hold_ids and hold.get('role_id') != 14:
-                    if has_reachable_unused_hold(limb):
-                        return False
-                if limb in ('RH', 'LH'):
-                    if hold.get('role_id') not in {12, 13, 14}:
-                        return False
-                    if last_hand == limb:
-                        return False
-                    ok, _ = self._dynamic_hand_reachable(hold, limb, limb_positions)
-                    if not ok:
-                        return False
-                    max_reach = MAX_HAND_REACH
-                else:
-                    max_reach = MAX_FOOT_REACH
-
-                prev_pos = limb_positions.get(limb)
-                if prev_pos is not None:
-                    dist = math.hypot(hold.get('x', 0) - prev_pos[0], hold.get('y', 0) - prev_pos[1])
-                    conservative_limit = max_reach * 0.95
-                    if dist > conservative_limit:
-                        return False
-                    if dist > max_reach:
-                        return False
-                return True
-                
             #Generate the sequence
             sequence_tokens = current_tokens.copy()
             
@@ -832,9 +916,13 @@ class ClimbGenerator:
                                 if token_id < logits.shape[0]:
                                     logits[token_id] += finish_bias
 
-                        # Finish-seeking: force a reachable finish when possible.
+                        # Finish-seeking: force a reachable finish when possible,
+                        # but only once enough moves have been generated so we
+                        # don't short-circuit to the finish from the start.
                         next_hand = 'LH' if last_hand == 'RH' else 'RH'
-                        finish_move = self._select_reachable_finish(
+                        finish_move = None
+                        if len(sequence_tokens) >= min_moves_before_finish:
+                            finish_move = self._select_reachable_finish(
                             next_hand,
                             limb_positions,
                             hold_map,
@@ -854,38 +942,35 @@ class ClimbGenerator:
                                 output, hidden = self.model(input_seq, hidden)
                                 continue
                         
-                        #Top-p (nucleus) sampling
+                        # Constrained decoding: mask all invalid tokens in one
+                        # O(|climb_holds| × 4) pass — no rejection loop needed.
+                        valid_mask = self._build_valid_token_mask(
+                            limb_positions, last_hand, hold_map, used_hold_ids
+                        )
+                        device_mask = valid_mask.to(logits.device)
+                        logits[~device_mask] = float('-inf')
+
+                        if not device_mask.any():
+                            break
+
+                        # Top-p (nucleus) sampling within the valid set
                         sorted_logits, sorted_indices = torch.sort(logits, descending=True)
                         cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
-                        
                         sorted_indices_to_remove = cumulative_probs > 0.9
                         sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
                         sorted_indices_to_remove[..., 0] = 0
-                        
-                        indices_to_remove = sorted_indices[sorted_indices_to_remove]
-                        logits[indices_to_remove] = float('-inf')
+                        logits[sorted_indices[sorted_indices_to_remove]] = float('-inf')
 
-                        next_token = None
-                        for _attempt in range(30):
-                            candidate = torch.multinomial(F.softmax(logits, dim=-1), num_samples=1).item()
-                            if candidate == 0:
-                                next_token = 0
-                                break
-                            move = decode_token(candidate)
-                            if is_reachable_move(move):
-                                next_token = candidate
-                                limb_positions[move['limb']] = (move.get('x', 0), move.get('y', 0))
-                                used_hold_ids.add(move.get('hold'))
-                                if move['limb'] in ('RH', 'LH'):
-                                    last_hand = move['limb']
-                                break
-                            logits[candidate] = float('-inf')
-
-                        if not next_token:
-                            break
-
+                        next_token = torch.multinomial(F.softmax(logits, dim=-1), num_samples=1).item()
                         if next_token == 0:
                             break
+
+                        move = decode_token(next_token)
+                        if move:
+                            limb_positions[move['limb']] = (move.get('x', 0), move.get('y', 0))
+                            used_hold_ids.add(move.get('hold'))
+                            if move['limb'] in ('RH', 'LH'):
+                                last_hand = move['limb']
 
                         sequence_tokens.append(next_token)
 
@@ -943,14 +1028,18 @@ class ClimbGenerator:
         else:
             cleaned = sequence.copy()
         
-        #make sure there is hand alternation
+        #make sure there is hand alternation (filter, not relabel)
+        # Relabeling the limb of a duplicate move is wrong: it doesn't update
+        # the position tracking and may produce an unreachable move under a
+        # different limb.  Dropping the move is safer; the reachability filter
+        # below will prune any further invalid moves.
         last_hand = None
         alternated = []
-        
+
         for move in cleaned:
-            if move['limb'] in ['RH', 'LH']:
+            if move['limb'] in ('RH', 'LH'):
                 if last_hand == move['limb']:
-                    move['limb'] = 'LH' if move['limb'] == 'RH' else 'RH'
+                    continue  # drop duplicate-hand move instead of relabeling
                 last_hand = move['limb']
             alternated.append(move)
 
@@ -1035,6 +1124,56 @@ class ClimbGenerator:
             return []
         
         return reachable
+
+    def _build_valid_token_mask(self, limb_positions, last_hand, hold_map, used_hold_ids):
+        """Build a boolean mask of shape (vocab_size,) where True marks a token as a
+        valid next move.  Replaces the 30-attempt rejection-sampling loop with a
+        single O(|climb_holds| × 4) pass that writes directly into the logit tensor
+        before sampling.
+        """
+        n_limbs = len(self.dataset.limb_mapping)
+        vocab_size = self.dataset.vocab_size
+        valid = torch.zeros(vocab_size, dtype=torch.bool)
+
+        for hold in hold_map.values():
+            hold_id = hold.get('hole_id')
+            if hold_id is None:
+                continue
+            hold_token = self.dataset.hold_mapping.get(hold_id)
+            if hold_token is None:
+                continue
+            role_id = hold.get('role_id')
+            hx = hold.get('x', 0)
+            hy = hold.get('y', 0)
+
+            for limb_name, limb_token in self.dataset.limb_mapping.items():
+                if limb_name in ('RH', 'LH'):
+                    if role_id not in {12, 13, 14}:
+                        continue
+                    if last_hand == limb_name:
+                        continue
+                    if hold_id in used_hold_ids and role_id != 14:
+                        continue
+                    ok, _ = self._dynamic_hand_reachable(hold, limb_name, limb_positions)
+                    if not ok:
+                        continue
+                    max_reach = MAX_HAND_REACH
+                else:  # RF / LF
+                    if hold_id in used_hold_ids and role_id != 14:
+                        continue
+                    max_reach = MAX_FOOT_REACH
+
+                prev_pos = limb_positions.get(limb_name)
+                if prev_pos is not None:
+                    dist = math.hypot(hx - prev_pos[0], hy - prev_pos[1])
+                    if dist > max_reach * 0.95:
+                        continue
+
+                token_id = (hold_token * n_limbs) + limb_token + 1
+                if 0 < token_id < vocab_size:
+                    valid[token_id] = True
+
+        return valid
 
     def _dynamic_hand_reachable(self, hold, limb, limb_positions):
         if not hold:

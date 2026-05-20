@@ -6,6 +6,7 @@ import random
 from datetime import datetime
 from collections import defaultdict
 from lstm import ClimbGenerator
+from sequence_generator import ClimbSequenceGenerator
 from viz import plot_climb_sequence, plot_reachability_map, plot_hold_density
 
 class ClimbCreator:
@@ -84,6 +85,22 @@ class ClimbCreator:
             'max_y': max(y_values)
         }
         
+    def _check_solvability(self, holds):
+        """Return True if beam search can find a sequence that ends on a finish hold."""
+        try:
+            gen = ClimbSequenceGenerator(holds)
+            res = gen.generate_sequences(beam_width=6)
+            if res.get('status') != 'success':
+                return False
+            seq = res.get('best_sequence', {}).get('sequence', [])
+            if not seq:
+                return False
+            last_role = gen.hold_dict.get(seq[-1].get('hold'), {}).get('role_id')
+            return last_role == 14
+        except Exception as e:
+            print(f"Solvability check error: {e}")
+            return False
+
     def list_wall_layouts(self):
         if not self.wall_layouts:
             print("No wall layouts found in the data file")
@@ -184,31 +201,48 @@ class ClimbCreator:
         hand_count = max(2, int(total_additional * params['hand_ratio']))
         foot_count = max(1, int(total_additional * params['foot_ratio']))
 
-        if available_holds:
-            #sort by y-coordinate
-            sorted_by_y = sorted(available_holds, key=lambda h: h.get('y', 0))
-            step_y = max(1, len(sorted_by_y) // (hand_count + 1))
-            
-            hand_holds = []
-            #select hand holds with good spacing
-            for i in range(hand_count):
-                index = min((i + 1) * step_y, len(sorted_by_y) - 1)
-                hold = sorted_by_y[index]
-                hold['role_id'] = 13  
-                hand_holds.append(hold)
-            
-            #seldct foot holds
-            remaining = [h for h in available_holds if h not in hand_holds]
-            foot_holds = random.sample(remaining, min(foot_count, len(remaining)))
-            for hold in foot_holds:
-                hold['role_id'] = 15  
+        # --- Intermediate hold selection with solvability validation ---
+        # Try up to 5 times with different random hold combinations until
+        # beam search confirms the route is solvable.
+        _MAX_RETRIES = 5
+        hand_holds, foot_holds = [], []
+        selected_holds = list(start_holds) + list(finish_holds)
+        _hand_holds: list = []
+        _foot_holds: list = []
+
+        for _attempt in range(_MAX_RETRIES):
+            if available_holds:
+                sorted_by_y = sorted(available_holds, key=lambda h: h.get('y', 0))
+                step_y = max(1, len(sorted_by_y) // (hand_count + 1))
+                # Shift starting index on retries to explore different hold sets
+                offset = random.randint(0, max(0, step_y - 1)) if _attempt > 0 else 0
+                _hand_holds = []
+                for i in range(hand_count):
+                    index = min((i + 1) * step_y + offset, len(sorted_by_y) - 1)
+                    _h = dict(sorted_by_y[index])   # copy — don't mutate layout
+                    _h['role_id'] = 13
+                    _hand_holds.append(_h)
+                _used_ids = {h.get('hole_id') for h in _hand_holds}
+                _remaining = [h for h in sorted_by_y if h.get('hole_id') not in _used_ids]
+                _foot_holds = [dict(h) for h in random.sample(_remaining, min(foot_count, len(_remaining)))]
+                for _h in _foot_holds:
+                    _h['role_id'] = 15
+            else:
+                _hand_holds, _foot_holds = [], []
+
+            _selected = list(start_holds) + _hand_holds + list(finish_holds) + _foot_holds
+            if self._check_solvability(_selected):
+                hand_holds, foot_holds = _hand_holds, _foot_holds
+                selected_holds = _selected
+                break
+
+            if _attempt < _MAX_RETRIES - 1:
+                print(f"Route unsolvable (attempt {_attempt + 1}/{_MAX_RETRIES}), resampling holds...")
         else:
-            hand_holds = []
-            foot_holds = []
-        
-        # Combine all selected holds
-        selected_holds = start_holds + hand_holds + finish_holds + foot_holds
-        
+            print(f"Warning: could not find solvable route after {_MAX_RETRIES} attempts, using last set")
+            hand_holds, foot_holds = _hand_holds, _foot_holds
+            selected_holds = list(start_holds) + hand_holds + list(finish_holds) + foot_holds
+
         # Create a sequence from the holds
         sequence = self._create_sequence(selected_holds)
         
