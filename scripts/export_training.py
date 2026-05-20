@@ -13,6 +13,34 @@ if ROOT not in sys.path:
 from sequence_generator import ClimbSequenceGenerator
 
 
+def _sequence_is_reachable(gen, seq):
+    limb_positions = {'RH': None, 'LH': None, 'RF': None, 'LF': None}
+
+    for move in seq:
+        limb = move.get('limb')
+        hold_id = move.get('hold')
+        if limb not in limb_positions or hold_id not in gen.hold_dict:
+            return False
+
+        current_hold = limb_positions[limb]
+        current_id = current_hold['hole_id'] if current_hold else -1
+        current_limbs_tuple = tuple(sorted(
+            (l, h['hole_id'] if h else -1)
+            for l, h in limb_positions.items()
+        ))
+
+        if limb in ('RH', 'LH'):
+            if not gen.is_valid_hand_transition(current_id, hold_id, limb, current_limbs_tuple):
+                return False
+        else:
+            if not gen.is_valid_foot_transition(current_id, hold_id, limb, current_limbs_tuple):
+                return False
+
+        limb_positions[limb] = gen.hold_dict[hold_id]
+
+    return True
+
+
 def export_training(input_file, output_file, per_climb=5, beam_width=6):
     with open(input_file) as f:
         data = json.load(f)
@@ -57,6 +85,10 @@ def export_training(input_file, output_file, per_climb=5, beam_width=6):
                         ok = False
                         break
             if not ok:
+                continue
+
+            # ensure reachability matches generator rules
+            if not _sequence_is_reachable(gen, seq):
                 continue
 
             evaluation = gen.evaluate_sequence(seq)

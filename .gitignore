@@ -93,3 +93,9 @@ env/
 /visualizations/
 /climb_visualizations/
 *.pth
+
+# Logs and export data
+logs/
+data/
+*.jsonl
+*.json

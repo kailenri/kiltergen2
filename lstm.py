@@ -1,4 +1,5 @@
 import json
+import math
 import numpy as np
 import torch
 import torch.nn as nn
@@ -12,6 +13,7 @@ import matplotlib.pyplot as plt
 import random
 from torch.nn import functional as F
 from viz import plot_climb_sequence, plot_sequence_cycle, plot_reachability_map, plot_hold_density
+from config import MAX_HAND_REACH, MAX_FOOT_REACH, X_SPACING
 
 class ClimbDataset(Dataset):
     def __init__(self, json_file, max_sequence_length=50, vocab_path=None):
@@ -309,6 +311,9 @@ class ClimbGenerator:
             14: 'Finish',
             15: 'Foot'
         }
+        self.debug_reachability = os.getenv('LSTM_REACH_DEBUG', '').lower() in ('1', 'true', 'yes')
+        if self.debug_reachability:
+            print("Reachability debug logging enabled")
         
     def _load_climb_data(self, json_file):
         with open(json_file) as f:
@@ -330,7 +335,12 @@ class ClimbGenerator:
 
     def load_model(self, model_path):
         try:
-            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+            if torch.cuda.is_available():
+                device = torch.device('cuda')
+            elif getattr(torch.backends, 'mps', None) and torch.backends.mps.is_available():
+                device = torch.device('mps')
+            else:
+                device = torch.device('cpu')
             
             self.model = ClimbLSTM(
                 vocab_size=self.dataset.vocab_size,
@@ -358,7 +368,12 @@ class ClimbGenerator:
         train_loader = DataLoader(train_data, batch_size=batch_size, shuffle=True)
         val_loader = DataLoader(val_data, batch_size=batch_size)
         
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        if torch.cuda.is_available():
+            device = torch.device('cuda')
+        elif getattr(torch.backends, 'mps', None) and torch.backends.mps.is_available():
+            device = torch.device('mps')
+        else:
+            device = torch.device('cpu')
         print(f"Training on: {device}")
         
         #Initialize model
@@ -642,6 +657,32 @@ class ClimbGenerator:
             #Pick a random climb if multiple are available
             current_id = climb_id if climb_id else random.choice(climb_ids)
             print(f"\nGenerating sequence {i+1} for climb: {self.climb_data[current_id]['name']}")
+
+            finish_token_ids = set()
+            finish_bias = 1.25
+            if current_id in self.climb_data:
+                finish_holds = [
+                    h.get('hole_id')
+                    for h in self.climb_data[current_id]['holds']
+                    if h.get('role_id') == 14
+                ]
+                for hold_id in finish_holds:
+                    hold_token = self.dataset.hold_mapping.get(hold_id)
+                    if hold_token is None:
+                        continue
+                    for limb in ('RH', 'LH'):
+                        limb_token = self.dataset.limb_mapping.get(limb)
+                        if limb_token is None:
+                            continue
+                        token_id = (hold_token * len(self.dataset.limb_mapping)) + limb_token + 1
+                        finish_token_ids.add(token_id)
+
+            hold_map = {h.get('hole_id'): h for h in self.climb_data[current_id]['holds']}
+            finish_holds = {
+                h.get('hole_id')
+                for h in self.climb_data[current_id]['holds']
+                if h.get('role_id') == 14
+            }
             
             #Get start holds
             start_holds = []
@@ -676,17 +717,103 @@ class ClimbGenerator:
                 
             #Generate sequence using start holds
             current_tokens = []
+            limb_positions = {'RH': None, 'LH': None, 'RF': None, 'LF': None}
+            used_hold_ids = set()
             for hold_id, limb in start_holds:
                 if hold_id in self.dataset.hold_mapping:
                     hold_token = self.dataset.hold_mapping[hold_id]
                     limb_token = self.dataset.limb_mapping[limb]
                     current_tokens.append((hold_token * len(self.dataset.limb_mapping)) + limb_token + 1)
+                hold = hold_map.get(hold_id)
+                if hold:
+                    limb_positions[limb] = (hold.get('x', 0), hold.get('y', 0))
+                    used_hold_ids.add(hold_id)
             
             if not current_tokens:
                 print(f"Could not create start tokens for climb {current_id}")
                 continue
                 
             print(f"Using {len(current_tokens)} start tokens")
+
+            rev_limb_mapping = {v: k for k, v in self.dataset.limb_mapping.items()}
+            last_hand = None
+
+            def decode_token(token_id):
+                if token_id == 0:
+                    return None
+                token_id -= 1
+                hold_token = token_id // len(self.dataset.limb_mapping)
+                limb_token = token_id % len(self.dataset.limb_mapping)
+                hold_id = self.dataset.reverse_hold_mapping.get(hold_token)
+                limb = rev_limb_mapping.get(limb_token)
+                if hold_id is None or limb is None:
+                    return None
+                hold = hold_map.get(hold_id, {})
+                return {
+                    'hold': hold_id,
+                    'limb': limb,
+                    'role_id': hold.get('role_id'),
+                    'x': hold.get('x', 0),
+                    'y': hold.get('y', 0),
+                    'name': hold.get('name', '')
+                }
+
+            def has_reachable_unused_hold(limb):
+                if limb in ('RH', 'LH') and last_hand == limb:
+                    return False
+                for hold in hold_map.values():
+                    if hold.get('role_id') not in {12, 13, 14} and limb in ('RH', 'LH'):
+                        continue
+                    hold_id = hold.get('hole_id')
+                    if hold_id in used_hold_ids and hold.get('role_id') != 14:
+                        continue
+                    if limb in ('RH', 'LH'):
+                        ok, _ = self._dynamic_hand_reachable(hold, limb, limb_positions)
+                        if not ok:
+                            continue
+                        max_reach = MAX_HAND_REACH
+                    else:
+                        max_reach = MAX_FOOT_REACH
+
+                    prev_pos = limb_positions.get(limb)
+                    if prev_pos is not None:
+                        dist = math.hypot(hold.get('x', 0) - prev_pos[0], hold.get('y', 0) - prev_pos[1])
+                        if dist > max_reach * 0.95:
+                            continue
+                    return True
+                return False
+
+            def is_reachable_move(move):
+                if not move:
+                    return False
+                limb = move.get('limb')
+                hold = hold_map.get(move.get('hold'))
+                if not hold:
+                    return False
+                if move.get('hold') in used_hold_ids and hold.get('role_id') != 14:
+                    if has_reachable_unused_hold(limb):
+                        return False
+                if limb in ('RH', 'LH'):
+                    if hold.get('role_id') not in {12, 13, 14}:
+                        return False
+                    if last_hand == limb:
+                        return False
+                    ok, _ = self._dynamic_hand_reachable(hold, limb, limb_positions)
+                    if not ok:
+                        return False
+                    max_reach = MAX_HAND_REACH
+                else:
+                    max_reach = MAX_FOOT_REACH
+
+                prev_pos = limb_positions.get(limb)
+                if prev_pos is not None:
+                    dist = math.hypot(hold.get('x', 0) - prev_pos[0], hold.get('y', 0) - prev_pos[1])
+                    conservative_limit = max_reach * 0.95
+                    if dist > conservative_limit:
+                        return False
+                    if dist > max_reach:
+                        return False
+                return True
                 
             #Generate the sequence
             sequence_tokens = current_tokens.copy()
@@ -699,6 +826,33 @@ class ClimbGenerator:
                     for _ in range(max_length):
                         logits = output[0, -1, :] / temperature
                         logits[0] = float('-inf')
+
+                        if finish_token_ids:
+                            for token_id in finish_token_ids:
+                                if token_id < logits.shape[0]:
+                                    logits[token_id] += finish_bias
+
+                        # Finish-seeking: force a reachable finish when possible.
+                        next_hand = 'LH' if last_hand == 'RH' else 'RH'
+                        finish_move = self._select_reachable_finish(
+                            next_hand,
+                            limb_positions,
+                            hold_map,
+                            finish_holds,
+                            reach_scale=1.1,
+                        )
+                        if finish_move:
+                            hold_token = self.dataset.hold_mapping.get(finish_move['hold'])
+                            limb_token = self.dataset.limb_mapping.get(next_hand)
+                            if hold_token is not None and limb_token is not None:
+                                next_token = (hold_token * len(self.dataset.limb_mapping)) + limb_token + 1
+                                sequence_tokens.append(next_token)
+                                limb_positions[next_hand] = (finish_move.get('x', 0), finish_move.get('y', 0))
+                                used_hold_ids.add(finish_move.get('hold'))
+                                last_hand = next_hand
+                                input_seq = torch.tensor([[next_token]], dtype=torch.long).to(device)
+                                output, hidden = self.model(input_seq, hidden)
+                                continue
                         
                         #Top-p (nucleus) sampling
                         sorted_logits, sorted_indices = torch.sort(logits, descending=True)
@@ -710,14 +864,31 @@ class ClimbGenerator:
                         
                         indices_to_remove = sorted_indices[sorted_indices_to_remove]
                         logits[indices_to_remove] = float('-inf')
-                        
-                        next_token = torch.multinomial(F.softmax(logits, dim=-1), num_samples=1).item()
-                        
+
+                        next_token = None
+                        for _attempt in range(30):
+                            candidate = torch.multinomial(F.softmax(logits, dim=-1), num_samples=1).item()
+                            if candidate == 0:
+                                next_token = 0
+                                break
+                            move = decode_token(candidate)
+                            if is_reachable_move(move):
+                                next_token = candidate
+                                limb_positions[move['limb']] = (move.get('x', 0), move.get('y', 0))
+                                used_hold_ids.add(move.get('hold'))
+                                if move['limb'] in ('RH', 'LH'):
+                                    last_hand = move['limb']
+                                break
+                            logits[candidate] = float('-inf')
+
+                        if not next_token:
+                            break
+
                         if next_token == 0:
                             break
-                            
+
                         sequence_tokens.append(next_token)
-                        
+
                         input_seq = torch.tensor([[next_token]], dtype=torch.long).to(device)
                         output, hidden = self.model(input_seq, hidden)
                 
@@ -782,26 +953,271 @@ class ClimbGenerator:
                     move['limb'] = 'LH' if move['limb'] == 'RH' else 'RH'
                 last_hand = move['limb']
             alternated.append(move)
+
+        #reachability filtering per limb
+        if climb_id in self.climb_data and self.climb_data[climb_id]['holds']:
+            hold_map = {h.get('hole_id'): h for h in self.climb_data[climb_id]['holds']}
+        else:
+            hold_map = {hid: info for hid, info in self.dataset.hold_info.items()}
+
+        limb_positions = {'RH': None, 'LH': None, 'RF': None, 'LF': None}
+        reachable = []
+
+        for move in alternated:
+            hold = hold_map.get(move['hold'])
+            if hold:
+                move['x'] = hold.get('x', move.get('x', 0))
+                move['y'] = hold.get('y', move.get('y', 0))
+                move['role_id'] = hold.get('role_id', move.get('role_id'))
+                move['name'] = hold.get('name', move.get('name', ''))
+
+            limb = move.get('limb')
+            if limb in ('RH', 'LH'):
+                if hold and hold.get('role_id') not in {12, 13, 14}:
+                    self._log_reachability(move, 'hand_role_invalid')
+                    continue
+                ok, reason = self._dynamic_hand_reachable(hold, limb, limb_positions)
+                if not ok:
+                    self._log_reachability(move, reason)
+                    continue
+                max_reach = MAX_HAND_REACH
+            else:
+                max_reach = MAX_FOOT_REACH
+
+            prev_pos = limb_positions.get(limb)
+            if prev_pos is not None and hold:
+                dist = math.hypot(hold.get('x', 0) - prev_pos[0], hold.get('y', 0) - prev_pos[1])
+                if dist > max_reach:
+                    self._log_reachability(move, f"limb_dist {dist:.2f} > {max_reach:.2f}")
+                    continue
+
+            if hold:
+                limb_positions[limb] = (hold.get('x', 0), hold.get('y', 0))
+            reachable.append(move)
         
         #makes sure the sequence ends with a finish hold
-        has_finish = any(m['hold'] in finish_holds for m in alternated[-2:]) if finish_holds else False
+        has_finish = any(m['hold'] in finish_holds for m in reachable[-2:]) if finish_holds else False
         
         #add finish if there is noen
         if not has_finish and finish_holds:
-            last_hand = alternated[-1]['limb'] if alternated and alternated[-1]['limb'] in ['RH', 'LH'] else 'RH'
+            last_hand = reachable[-1]['limb'] if reachable and reachable[-1]['limb'] in ['RH', 'LH'] else 'RH'
             next_hand = 'LH' if last_hand == 'RH' else 'RH'
-            
-            finish_hold = next(iter(finish_holds))
-            alternated.append({
-                'hold': finish_hold,
-                'limb': next_hand,
-                'role_id': 14,
-                'x': self.dataset.hold_info.get(finish_hold, {}).get('x', 0),
-                'y': self.dataset.hold_info.get(finish_hold, {}).get('y', 0),
-                'name': self.dataset.hold_info.get(finish_hold, {}).get('name', '')
-            })
+
+            finish_move = self._select_reachable_finish(next_hand, limb_positions, hold_map, finish_holds)
+            if finish_move:
+                reachable.append(finish_move)
+            else:
+                self._log_reachability({'limb': next_hand, 'hold': '?'}, 'finish_unreachable')
+                fallback = self._select_progress_hand_hold(next_hand, limb_positions, hold_map, finish_holds)
+                if fallback:
+                    reachable.append(fallback)
+
+        # If no finish is reached, allow up to two additional reachable moves to reach it.
+        has_finish = any(m['hold'] in finish_holds for m in reachable[-2:]) if finish_holds else False
+        if finish_holds and not has_finish:
+            for _ in range(2):
+                last_hand = reachable[-1]['limb'] if reachable and reachable[-1]['limb'] in ['RH', 'LH'] else 'RH'
+                next_hand = 'LH' if last_hand == 'RH' else 'RH'
+                finish_move = self._select_reachable_finish(next_hand, limb_positions, hold_map, finish_holds)
+                if finish_move:
+                    reachable.append(finish_move)
+                    break
+
+                progress_move = self._select_progress_hand_hold(next_hand, limb_positions, hold_map, finish_holds)
+                if not progress_move:
+                    break
+                reachable.append(progress_move)
+                limb_positions[next_hand] = (progress_move.get('x', 0), progress_move.get('y', 0))
+
+        has_finish = any(m['hold'] in finish_holds for m in reachable[-2:]) if finish_holds else False
+        if finish_holds and not has_finish:
+            self._log_reachability({'limb': '?', 'hold': '?'}, 'finish_required')
+            return []
         
-        return alternated
+        return reachable
+
+    def _dynamic_hand_reachable(self, hold, limb, limb_positions):
+        if not hold:
+            return False, 'missing_hold'
+
+        foot_positions = [p for k, p in limb_positions.items() if k in ('RF', 'LF') and p is not None]
+        # If no feet planted, fall back to a simple reach check.
+        if not foot_positions:
+            prev_pos = limb_positions.get(limb)
+            if prev_pos is None:
+                return True, None
+            dist = math.hypot(hold.get('x', 0) - prev_pos[0], hold.get('y', 0) - prev_pos[1])
+            if dist > MAX_HAND_REACH:
+                return False, f"hand_dist {dist:.2f} > {MAX_HAND_REACH:.2f}"
+            return True, None
+
+        hip = self._estimate_hip(foot_positions)
+        shoulder = self._estimate_shoulder(hip)
+        rx = MAX_HAND_REACH * 0.9
+        ry = MAX_HAND_REACH * 0.6 + (X_SPACING * 1.2)
+
+        hold_xy = (hold.get('x', 0), hold.get('y', 0))
+        dnorm = self._ellipse_dnorm(hold_xy, shoulder, rx, ry)
+        if dnorm > 1.15:
+            return False, f"ellipse_dnorm {dnorm:.2f} > 1.15"
+
+        # stability: COM projection vs support polygon
+        com = (hip[0], hip[1] + X_SPACING * 1.2)
+        support_pts = list(foot_positions)
+        for k in ('RH', 'LH'):
+            if limb_positions.get(k) is not None and k != limb:
+                support_pts.append(limb_positions[k])
+        support_pts.append(hold_xy)
+
+        if len(support_pts) >= 3:
+            hull = self._convex_hull(support_pts)
+            if not self._point_in_poly(com, hull) and dnorm > 1.05:
+                return False, 'com_outside_support'
+
+        return True, None
+
+    def _select_reachable_finish(self, limb, limb_positions, hold_map, finish_holds, reach_scale=1.0):
+        if not finish_holds:
+            return None
+
+        prev_pos = limb_positions.get(limb)
+        candidates = []
+
+        for hold_id in finish_holds:
+            hold = hold_map.get(hold_id)
+            if not hold:
+                continue
+            ok, _ = self._dynamic_hand_reachable(hold, limb, limb_positions)
+            if not ok:
+                continue
+            if prev_pos is not None:
+                dist = math.hypot(hold.get('x', 0) - prev_pos[0], hold.get('y', 0) - prev_pos[1])
+                if dist > MAX_HAND_REACH * reach_scale:
+                    continue
+            candidates.append(hold)
+
+        if not candidates:
+            return None
+
+        def sort_key(h):
+            if prev_pos is None:
+                return (-h.get('y', 0), 0.0)
+            return (math.hypot(h.get('x', 0) - prev_pos[0], h.get('y', 0) - prev_pos[1]), -h.get('y', 0))
+
+        best = sorted(candidates, key=sort_key)[0]
+        return {
+            'hold': best.get('hole_id'),
+            'limb': limb,
+            'role_id': 14,
+            'x': best.get('x', 0),
+            'y': best.get('y', 0),
+            'name': best.get('name', '')
+        }
+
+    def _select_progress_hand_hold(self, limb, limb_positions, hold_map, finish_holds):
+        occupied = {pos for pos in limb_positions.values() if pos is not None}
+        prev_pos = limb_positions.get(limb)
+
+        finish_positions = []
+        for hold_id in finish_holds or []:
+            hold = hold_map.get(hold_id)
+            if hold:
+                finish_positions.append((hold.get('x', 0), hold.get('y', 0)))
+
+        def dist_to_finish(xy):
+            if not finish_positions:
+                return float('inf')
+            return min(math.hypot(xy[0] - fx, xy[1] - fy) for fx, fy in finish_positions)
+
+        candidates = []
+        for hold in hold_map.values():
+            if hold.get('role_id') not in {12, 13, 14}:
+                continue
+            hold_xy = (hold.get('x', 0), hold.get('y', 0))
+            if hold_xy in occupied:
+                continue
+            ok, _ = self._dynamic_hand_reachable(hold, limb, limb_positions)
+            if not ok:
+                continue
+            if prev_pos is not None:
+                move_dist = math.hypot(hold_xy[0] - prev_pos[0], hold_xy[1] - prev_pos[1])
+                if move_dist > MAX_HAND_REACH:
+                    continue
+            candidates.append(hold)
+
+        if not candidates:
+            self._log_reachability({'limb': limb, 'hold': '?'}, 'fallback_unavailable')
+            return None
+
+        def sort_key(h):
+            h_xy = (h.get('x', 0), h.get('y', 0))
+            move_dist = 0.0 if prev_pos is None else math.hypot(h_xy[0] - prev_pos[0], h_xy[1] - prev_pos[1])
+            return (dist_to_finish(h_xy), -h.get('y', 0), move_dist)
+
+        best = sorted(candidates, key=sort_key)[0]
+        self._log_reachability({'limb': limb, 'hold': best.get('hole_id')}, 'fallback_selected')
+        return {
+            'hold': best.get('hole_id'),
+            'limb': limb,
+            'role_id': best.get('role_id', 13),
+            'x': best.get('x', 0),
+            'y': best.get('y', 0),
+            'name': best.get('name', '')
+        }
+
+    def _log_reachability(self, move, reason):
+        if not self.debug_reachability:
+            return
+        limb = move.get('limb', '?') if isinstance(move, dict) else '?'
+        hold_id = move.get('hold', '?') if isinstance(move, dict) else '?'
+        print(f"Reachability reject: limb={limb} hold={hold_id} reason={reason}")
+
+    def _estimate_hip(self, foot_positions):
+        arr = np.array(foot_positions)
+        return (float(np.mean(arr[:, 0])), float(np.mean(arr[:, 1])))
+
+    def _estimate_shoulder(self, hip_xy):
+        return (hip_xy[0], hip_xy[1] + X_SPACING * 2.0)
+
+    def _ellipse_dnorm(self, hold_xy, shoulder_xy, rx, ry):
+        dx = (hold_xy[0] - shoulder_xy[0]) / rx
+        dy = (hold_xy[1] - shoulder_xy[1]) / ry
+        return math.hypot(dx, dy)
+
+    def _convex_hull(self, points):
+        pts = sorted(set(points))
+        if len(pts) <= 1:
+            return pts
+
+        def cross(o, a, b):
+            return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+
+        lower = []
+        for p in pts:
+            while len(lower) >= 2 and cross(lower[-2], lower[-1], p) <= 0:
+                lower.pop()
+            lower.append(p)
+
+        upper = []
+        for p in reversed(pts):
+            while len(upper) >= 2 and cross(upper[-2], upper[-1], p) <= 0:
+                upper.pop()
+            upper.append(p)
+
+        return lower[:-1] + upper[:-1]
+
+    def _point_in_poly(self, pt, poly):
+        if not poly:
+            return False
+        x, y = pt
+        inside = False
+        n = len(poly)
+        for i in range(n):
+            x0, y0 = poly[i]
+            x1, y1 = poly[(i + 1) % n]
+            if ((y0 > y) != (y1 > y)) and (x < (x1 - x0) * (y - y0) / (y1 - y0 + 1e-12) + x0):
+                inside = not inside
+        return inside
 
     def visualize_sequence(self, sequence, climb_id=None, save_path=None, viz_type='path'):
         if not sequence:

@@ -47,6 +47,74 @@ class ClimbSequenceGenerator:
         np.fill_diagonal(distances, 0)
         return distances
 
+    # --- Physically informed reachability helpers ---
+    def _parse_limbs_tuple(self, limbs_tuple: Tuple) -> Dict[str, Tuple[float, float] or None]:
+        """Convert cached limbs tuple (('LH', id), ...) into a mapping limb -> (x,y) or None"""
+        positions = {'RH': None, 'LH': None, 'RF': None, 'LF': None}
+        for limb, hid in limbs_tuple:
+            if hid is None or hid == -1:
+                positions[limb] = None
+                continue
+            hold = self.hold_dict.get(hid)
+            if hold:
+                positions[limb] = (hold['x'], hold['y'])
+            else:
+                positions[limb] = None
+        return positions
+
+    def _estimate_hip(self, foot_positions: List[Tuple[float, float]]):
+        if not foot_positions:
+            return None
+        arr = np.array(foot_positions)
+        return tuple(np.mean(arr, axis=0))
+
+    def _estimate_shoulder(self, hip_xy: Tuple[float, float]):
+        # shoulder offset upward; tuned relative to X_SPACING
+        shoulder_offset = X_SPACING * 2.0
+        return (hip_xy[0], hip_xy[1] + shoulder_offset)
+
+    def _ellipse_dnorm(self, hold_xy: Tuple[float, float], shoulder_xy: Tuple[float, float], rx: float, ry: float) -> float:
+        dx = (hold_xy[0] - shoulder_xy[0]) / rx
+        dy = (hold_xy[1] - shoulder_xy[1]) / ry
+        return math.hypot(dx, dy)
+
+    def _convex_hull(self, points: List[Tuple[float, float]]):
+        # Monotone chain convex hull (returns list of points on hull in CCW)
+        pts = sorted(set(points))
+        if len(pts) <= 1:
+            return pts
+
+        def cross(o, a, b):
+            return (a[0]-o[0])*(b[1]-o[1]) - (a[1]-o[1])*(b[0]-o[0])
+
+        lower = []
+        for p in pts:
+            while len(lower) >= 2 and cross(lower[-2], lower[-1], p) <= 0:
+                lower.pop()
+            lower.append(p)
+
+        upper = []
+        for p in reversed(pts):
+            while len(upper) >= 2 and cross(upper[-2], upper[-1], p) <= 0:
+                upper.pop()
+            upper.append(p)
+
+        return lower[:-1] + upper[:-1]
+
+    def _point_in_poly(self, pt: Tuple[float, float], poly: List[Tuple[float, float]]) -> bool:
+        # ray casting algorithm; poly must be a list of (x,y)
+        if not poly:
+            return False
+        x, y = pt
+        inside = False
+        n = len(poly)
+        for i in range(n):
+            x0, y0 = poly[i]
+            x1, y1 = poly[(i+1) % n]
+            if ((y0 > y) != (y1 > y)) and (x < (x1 - x0) * (y - y0) / (y1 - y0 + 1e-12) + x0):
+                inside = not inside
+        return inside
+
     def _compute_hand_reachability_matrix(self) -> np.ndarray:
         n = len(self.holds)
         reachable = np.zeros((n, n), dtype=bool)
@@ -124,25 +192,61 @@ class ClimbSequenceGenerator:
 
     @lru_cache(maxsize=100000)
     def is_valid_hand_transition(self, current_id: int, next_id: int, limb: str, current_limbs: Tuple) -> bool:
-        #ensures that the hand transition is valid based on constraints
+        # ensures that the hand transition is valid based on constraints
         next_hold = self.hold_dict[next_id]
-        
-        #consider only valid holds
+
+        # consider only valid holds
         if next_hold['role_id'] not in {12, 13, 14}:
             return False
-            
-        #checks if hold is occupied 
+
+        # checks if hold is occupied
         for other_limb, hold_id in current_limbs:
             if other_limb != limb and hold_id == next_id:
                 return False
-        
-        #checks reachability
-        if current_id != -1:  
-            i = self.hold_ids.index(current_id)
-            j = self.hold_ids.index(next_id)
-            if not self.hand_reach_matrix[i, j]:
+
+        # dynamic reachability: shoulder-centric anisotropic ellipse + COM/stability
+        positions = self._parse_limbs_tuple(current_limbs)
+        foot_positions = [p for k, p in positions.items() if k in ('RF', 'LF') and p is not None]
+
+        # if we don't have feet planted, fall back to coarse matrix check
+        hip = self._estimate_hip(foot_positions)
+        if hip is None:
+            if current_id != -1:
+                try:
+                    i = self.hold_ids.index(current_id)
+                    j = self.hold_ids.index(next_id)
+                    if not self.hand_reach_matrix[i, j]:
+                        return False
+                except ValueError:
+                    return False
+            return True
+
+        shoulder = self._estimate_shoulder(hip)
+        rx = MAX_HAND_REACH * 0.9
+        ry = MAX_HAND_REACH * 0.6 + (X_SPACING * 1.2)
+
+        hold_xy = (next_hold['x'], next_hold['y'])
+        dnorm = self._ellipse_dnorm(hold_xy, shoulder, rx, ry)
+        dynamic_allow = 1.15
+        if dnorm > dynamic_allow:
+            return False
+
+        # stability: check COM projection vs support polygon
+        com_offset = X_SPACING * 1.2
+        com = (hip[0], hip[1] + com_offset)
+
+        support_pts = list(foot_positions)
+        for k in ('RH', 'LH'):
+            if positions.get(k) is not None and k != limb:
+                support_pts.append(positions[k])
+        support_pts.append(hold_xy)
+
+        if len(support_pts) >= 3:
+            hull = self._convex_hull(support_pts)
+            inside = self._point_in_poly(com, hull)
+            if not inside and dnorm > 1.05:
                 return False
-                
+
         return True
 
     def is_valid_foot_transition(self, current_id: int, next_id: int, limb: str, current_limbs: Tuple) -> bool:
