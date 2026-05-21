@@ -64,44 +64,56 @@ def export_training(input_file, output_file, per_climb=5, beam_width=6):
             print(f"No sequences for climb {climb_id}")
             continue
 
-        cleaned = []
-        for seq_i, seqobj in enumerate(res.get('all_sequences', [])[:per_climb]):
-            seq = seqobj.get('sequence', [])
+        def _seq_is_valid(seq):
+            """Quality filter: ends on finish hold, hands on hand holds, reachable."""
             if not seq:
-                continue
-
-            # require final move to be a finish hold
-            last = seq[-1]
-            last_role = gen.hold_dict.get(last['hold'], {}).get('role_id')
-            if last_role != 14:
-                continue
-
-            # ensure hands are only on hand holds
-            ok = True
+                return False
+            if gen.hold_dict.get(seq[-1]['hold'], {}).get('role_id') != 14:
+                return False
             for m in seq:
                 if m['limb'] in ('RH', 'LH'):
-                    role = gen.hold_dict.get(m['hold'], {}).get('role_id')
-                    if role not in {12, 13, 14}:
-                        ok = False
-                        break
-            if not ok:
-                continue
+                    if gen.hold_dict.get(m['hold'], {}).get('role_id') not in {12, 13, 14}:
+                        return False
+            return _sequence_is_reachable(gen, seq)
 
-            # ensure reachability matches generator rules
-            if not _sequence_is_reachable(gen, seq):
-                continue
+        all_seqs = res.get('all_sequences', [])
+        # Separate sequences with/without foot moves so we target a balanced mix.
+        regular_seqs = [s for s in all_seqs
+                        if not any(m['limb'] in ('RF', 'LF') for m in s.get('sequence', []))]
+        foot_seqs    = [s for s in all_seqs
+                        if     any(m['limb'] in ('RF', 'LF') for m in s.get('sequence', []))]
 
-            evaluation = gen.evaluate_sequence(seq)
-            # create a result entry per sequence so ClimbDataset can consume it
+        n_regular_target = max(1, (per_climb + 1) // 2)   # ceil(per_climb / 2)
+        n_foot_target    = per_climb // 2
+
+        n_regular_kept = n_foot_kept = 0
+        seq_i = 0
+        for seqobj in regular_seqs + foot_seqs:
+            if n_regular_kept + n_foot_kept >= per_climb:
+                break
+            seq = seqobj.get('sequence', [])
+            if not _seq_is_valid(seq):
+                continue
+            has_foot = any(m['limb'] in ('RF', 'LF') for m in seq)
+            if has_foot:
+                if n_foot_kept >= n_foot_target:
+                    continue
+                n_foot_kept += 1
+            else:
+                if n_regular_kept >= n_regular_target:
+                    continue
+                n_regular_kept += 1
             results.append({
                 'id': f"{climb_id}_gen_{seq_i}",
                 'name': name,
+                'difficulty': result.get('difficulty'),
                 'best_sequence': {
                     'holds': holds,
                     'sequence': seq
                 },
-                'evaluation': evaluation
+                'evaluation': gen.evaluate_sequence(seq)
             })
+            seq_i += 1
 
     out_dir = os.path.dirname(output_file)
     if out_dir:

@@ -15,6 +15,34 @@ from torch.nn import functional as F
 from viz import plot_climb_sequence, plot_sequence_cycle, plot_reachability_map, plot_hold_density
 from config import MAX_HAND_REACH, MAX_FOOT_REACH, X_SPACING
 
+# ---------------------------------------------------------------------------
+# Difficulty conditioning helpers
+# ---------------------------------------------------------------------------
+
+NUM_DIFFICULTY_BUCKETS = 5
+
+
+def difficulty_to_bucket(d):
+    """Map a raw Kilter difficulty integer (1–39) to a 1-based bucket (1–5).
+    Bucket 0 is reserved as the 'unknown' / no-conditioning padding index.
+
+    Mapping (from difficulty_grades table, is_listed grades):
+      1 → V0–V2  (difficulty  1–15)
+      2 → V3–V5  (difficulty 16–20)
+      3 → V6–V8  (difficulty 21–24)
+      4 → V9–V12 (difficulty 25–28)
+      5 → V13+   (difficulty 29+)
+    """
+    if d is None:
+        return 0
+    d = int(round(float(d)))
+    if d <= 15: return 1
+    if d <= 20: return 2
+    if d <= 24: return 3
+    if d <= 28: return 4
+    return 5
+
+
 class ClimbDataset(Dataset):
     def __init__(self, json_file, max_sequence_length=50, vocab_path=None):
         print(f"Loading dataset from {json_file}")
@@ -22,6 +50,7 @@ class ClimbDataset(Dataset):
             data = json.load(f)
         
         self.sequences = []
+        self.sequence_difficulties = []   # parallel list: difficulty bucket per sequence
         self.hold_mapping = {'PAD': 0}
         self.reverse_hold_mapping = {0: 'PAD'}
         self.limb_mapping = {'RH': 0, 'LH': 1, 'RF': 2, 'LF': 3}
@@ -183,12 +212,15 @@ class ClimbDataset(Dataset):
                     encoded_sequence = encoded_sequence[:self.max_sequence_length]
                 
                 self.sequences.append(encoded_sequence)
+                self.sequence_difficulties.append(difficulty_to_bucket(result.get('difficulty')))
         
         print(f"Processed {total_sequences} sequences, {valid_sequences} valid")
 
     def augment_sequences(self):
         original_count = len(self.sequences)
         new_sequences = []
+        new_difficulties = []
+        original_difficulties = list(self.sequence_difficulties)
 
         # --- Build spatial mirror lookup for spatially-correct mirroring ---
         # Mirror: limb L↔R AND hold position flipped about the wall's centre X.
@@ -219,7 +251,7 @@ class ClimbDataset(Dataset):
         # Swap L↔R limbs AND remap each hold to its mirrored counterpart.
         # Skip any sequence whose holds lack a mirror partner in the vocab.
         n_limbs = len(self.limb_mapping)
-        for seq in self.sequences[:original_count]:
+        for i, seq in enumerate(self.sequences[:original_count]):
             mirrored = []
             valid = True
             for token in seq:
@@ -246,25 +278,28 @@ class ClimbDataset(Dataset):
 
             if valid:
                 new_sequences.append(mirrored)
+                new_difficulties.append(original_difficulties[i] if original_difficulties else 0)
 
         # --- Subsequence creation: valid prefixes only ---
         # Only keep the first half so every sub-sequence starts from the beginning
         # with known limb positions. The second half (mid-sequence onwards) is
         # omitted because it would start with unknown limb context.
         min_subseq_length = 8
-        for seq in self.sequences[:original_count]:
+        for i, seq in enumerate(self.sequences[:original_count]):
             actual_seq = [t for t in seq if t != 0]
             if len(actual_seq) >= min_subseq_length * 2:
                 first_half = actual_seq[:len(actual_seq) // 2]
                 if len(first_half) >= min_subseq_length:
                     padded = first_half + [0] * (self.max_sequence_length - len(first_half))
                     new_sequences.append(padded)
+                    new_difficulties.append(original_difficulties[i] if original_difficulties else 0)
 
         # Jitter augmentation removed: randomly replacing tokens with arbitrary
         # tokens from the same climb ignores ordering constraints and produces
         # physically invalid transitions that pollute the training distribution.
 
         self.sequences.extend(new_sequences)
+        self.sequence_difficulties.extend(new_difficulties)
         print(f"Augmented dataset from {original_count} to {len(self.sequences)} sequences")
 
     def __len__(self):
@@ -272,9 +307,11 @@ class ClimbDataset(Dataset):
     
     def __getitem__(self, idx):
         sequence = self.sequences[idx]
+        difficulty = self.sequence_difficulties[idx] if self.sequence_difficulties else 0
         return (
             torch.tensor(sequence[:-1], dtype=torch.long),
-            torch.tensor(sequence[1:], dtype=torch.long)
+            torch.tensor(sequence[1:], dtype=torch.long),
+            torch.tensor(difficulty, dtype=torch.long),
         )
     
     def decode_sequence(self, encoded_sequence):
@@ -316,8 +353,11 @@ class FocalLoss(nn.Module):
 
 class ClimbLSTM(nn.Module):
     def __init__(self, vocab_size, embedding_dim=128, hidden_dim=256, num_layers=2, dropout=0.2,
-                 spatial_features=None, spatial_proj_dim=32):
+                 spatial_features=None, spatial_proj_dim=32,
+                 num_difficulty_buckets=0, difficulty_embed_dim=16):
         super().__init__()
+        self.num_layers = num_layers
+        self.hidden_dim = hidden_dim
         self.embedding = nn.Embedding(vocab_size, embedding_dim, padding_idx=0)
 
         # Optional spatial feature branch: projects per-token [x, y, role, limb]
@@ -348,6 +388,20 @@ class ClimbLSTM(nn.Module):
         self.layer_norm = nn.LayerNorm(hidden_dim)
         self.dropout = nn.Dropout(dropout)
         self.fc = nn.Linear(hidden_dim, vocab_size)
+
+        # Difficulty conditioning: condition the LSTM's initial (h, c) on a
+        # bucketed difficulty level.  Padding index 0 = 'unknown' → zero vector.
+        if num_difficulty_buckets > 0:
+            self.difficulty_embedding = nn.Embedding(
+                num_difficulty_buckets + 1, difficulty_embed_dim, padding_idx=0
+            )
+            self.difficulty_h_proj = nn.Linear(difficulty_embed_dim, num_layers * hidden_dim)
+            self.difficulty_c_proj = nn.Linear(difficulty_embed_dim, num_layers * hidden_dim)
+        else:
+            self.difficulty_embedding = None
+            self.difficulty_h_proj = None
+            self.difficulty_c_proj = None
+
         self._init_weights()
 
     def _init_weights(self):
@@ -356,7 +410,7 @@ class ClimbLSTM(nn.Module):
         self.fc.weight.data.uniform_(-init_range, init_range)
         self.fc.bias.data.zero_()
 
-    def forward(self, x, hidden=None):
+    def forward(self, x, hidden=None, difficulty=None):
         embedded = self.embedding(x)
 
         if self.spatial_features is not None and self.spatial_proj is not None:
@@ -364,6 +418,14 @@ class ClimbLSTM(nn.Module):
             spatial_raw = self.spatial_features[x]          # (batch, seq_len, feat_dim)
             spatial_emb = self.spatial_proj(spatial_raw)    # (batch, seq_len, proj_dim)
             embedded = torch.cat([embedded, spatial_emb], dim=-1)
+
+        # Condition initial hidden state on difficulty (first step only — when
+        # hidden is None — so subsequent generation steps are unaffected).
+        if self.difficulty_embedding is not None and difficulty is not None and hidden is None:
+            d_emb = self.difficulty_embedding(difficulty)   # (batch, diff_dim)
+            h0 = self.difficulty_h_proj(d_emb).view(-1, self.num_layers, self.hidden_dim).permute(1, 0, 2).contiguous()
+            c0 = self.difficulty_c_proj(d_emb).view(-1, self.num_layers, self.hidden_dim).permute(1, 0, 2).contiguous()
+            hidden = (h0, c0)
 
         lstm_out, hidden = self.lstm(embedded, hidden)
         out = self.dropout(self.layer_norm(lstm_out))
@@ -450,6 +512,7 @@ class ClimbGenerator:
                 num_layers=2,
                 dropout=0.2,
                 spatial_features=self.dataset.build_spatial_features(),
+                num_difficulty_buckets=NUM_DIFFICULTY_BUCKETS,
             ).to(device)
             
             state_dict = torch.load(model_path, map_location=device)
@@ -486,6 +549,7 @@ class ClimbGenerator:
             num_layers=2,
             dropout=0.2,
             spatial_features=self.dataset.build_spatial_features(),
+            num_difficulty_buckets=NUM_DIFFICULTY_BUCKETS,
         ).to(device)
         
         #Set up loss, optimizer and schedulers
@@ -522,8 +586,8 @@ class ClimbGenerator:
             epoch_loss = 0
             
             progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}")
-            for inputs, targets in progress_bar:
-                inputs, targets = inputs.to(device), targets.to(device)
+            for inputs, targets, difficulties in progress_bar:
+                inputs, targets, difficulties = inputs.to(device), targets.to(device), difficulties.to(device)
                 
                 #Raise on invalid tokens — catches data pipeline bugs early
                 if (inputs >= self.dataset.vocab_size).any() or (targets >= self.dataset.vocab_size).any():
@@ -534,7 +598,7 @@ class ClimbGenerator:
                     )
                 
                 optimizer.zero_grad()
-                outputs, _ = self.model(inputs)
+                outputs, _ = self.model(inputs, difficulty=difficulties)
                 loss = criterion(outputs.reshape(-1, self.dataset.vocab_size), targets.reshape(-1))
                 loss.backward()
                 
@@ -653,8 +717,8 @@ class ClimbGenerator:
         total_loss = 0
         
         with torch.no_grad():
-            for inputs, targets in loader:
-                inputs, targets = inputs.to(device), targets.to(device)
+            for inputs, targets, difficulties in loader:
+                inputs, targets, difficulties = inputs.to(device), targets.to(device), difficulties.to(device)
                 
                 #Skip batch if it contains invalid tokens
                 if (inputs >= self.dataset.vocab_size).any() or (targets >= self.dataset.vocab_size).any():
@@ -664,7 +728,7 @@ class ClimbGenerator:
                         "Re-build vocabulary or re-export training data."
                     )
                 
-                outputs, _ = self.model(inputs)
+                outputs, _ = self.model(inputs, difficulty=difficulties)
                 loss = criterion(outputs.reshape(-1, self.dataset.vocab_size), targets.reshape(-1))
                 total_loss += loss.item()
         
@@ -764,12 +828,14 @@ class ClimbGenerator:
         plt.savefig('training_history.png')
         plt.close()
 
-    def generate(self, climb_id=None, num_sequences=3, temperature=0.8, max_length=30):
+    def generate(self, climb_id=None, num_sequences=3, temperature=0.8, max_length=30, difficulty=None):
         if not self.model:
             print("Error: Model not loaded")
             return []
         
         device = next(self.model.parameters()).device
+        diff_bucket = difficulty_to_bucket(difficulty) if difficulty is not None else 0
+        diff_tensor = torch.tensor([diff_bucket], dtype=torch.long).to(device)
         sequences = []
         
         #Get climb IDs to generate 
@@ -856,14 +922,6 @@ class ClimbGenerator:
                     limb_positions[limb] = (hold.get('x', 0), hold.get('y', 0))
                     used_hold_ids.add(hold_id)
 
-            # Seed foot positions from the start holds so the kinematic model
-            # (_dynamic_hand_reachable) can compute hip/shoulder estimates
-            # immediately rather than falling back to the flat distance check.
-            if limb_positions['RF'] is None:
-                limb_positions['RF'] = limb_positions.get('RH') or limb_positions.get('LH')
-            if limb_positions['LF'] is None:
-                limb_positions['LF'] = limb_positions.get('LH') or limb_positions.get('RH')
-            
             if not current_tokens:
                 print(f"Could not create start tokens for climb {current_id}")
                 continue
@@ -905,7 +963,7 @@ class ClimbGenerator:
             try:
                 with torch.no_grad():
                     input_seq = torch.tensor([current_tokens], dtype=torch.long).to(device)
-                    output, hidden = self.model(input_seq)
+                    output, hidden = self.model(input_seq, difficulty=diff_tensor)
                     
                     for _ in range(max_length):
                         logits = output[0, -1, :] / temperature
@@ -938,9 +996,8 @@ class ClimbGenerator:
                                 limb_positions[next_hand] = (finish_move.get('x', 0), finish_move.get('y', 0))
                                 used_hold_ids.add(finish_move.get('hold'))
                                 last_hand = next_hand
-                                input_seq = torch.tensor([[next_token]], dtype=torch.long).to(device)
-                                output, hidden = self.model(input_seq, hidden)
-                                continue
+                            # Finish reached — stop generating.
+                            break
                         
                         # Constrained decoding: mask all invalid tokens in one
                         # O(|climb_holds| × 4) pass — no rejection loop needed.
@@ -971,6 +1028,11 @@ class ClimbGenerator:
                             used_hold_ids.add(move.get('hold'))
                             if move['limb'] in ('RH', 'LH'):
                                 last_hand = move['limb']
+
+                            # Stop immediately if we landed on a finish hold.
+                            if move.get('role_id') == 14:
+                                sequence_tokens.append(next_token)
+                                break
 
                         sequence_tokens.append(next_token)
 
@@ -1085,9 +1147,21 @@ class ClimbGenerator:
             reachable.append(move)
         
         #makes sure the sequence ends with a finish hold
+        # Re-apply alternation after reachability filtering may have exposed
+        # consecutive same-limb moves that the first pass already cleared.
+        last_hand_re = None
+        reachable_alt = []
+        for move in reachable:
+            if move['limb'] in ('RH', 'LH'):
+                if last_hand_re == move['limb']:
+                    continue
+                last_hand_re = move['limb']
+            reachable_alt.append(move)
+        reachable = reachable_alt
+
         has_finish = any(m['hold'] in finish_holds for m in reachable[-2:]) if finish_holds else False
         
-        #add finish if there is noen
+        #add finish if there is none
         if not has_finish and finish_holds:
             last_hand = reachable[-1]['limb'] if reachable and reachable[-1]['limb'] in ['RH', 'LH'] else 'RH'
             next_hand = 'LH' if last_hand == 'RH' else 'RH'
@@ -1101,10 +1175,10 @@ class ClimbGenerator:
                 if fallback:
                     reachable.append(fallback)
 
-        # If no finish is reached, allow up to two additional reachable moves to reach it.
+        # If no finish is reached, allow up to four additional reachable moves to reach it.
         has_finish = any(m['hold'] in finish_holds for m in reachable[-2:]) if finish_holds else False
         if finish_holds and not has_finish:
-            for _ in range(2):
+            for _ in range(4):
                 last_hand = reachable[-1]['limb'] if reachable and reachable[-1]['limb'] in ['RH', 'LH'] else 'RH'
                 next_hand = 'LH' if last_hand == 'RH' else 'RH'
                 finish_move = self._select_reachable_finish(next_hand, limb_positions, hold_map, finish_holds)
@@ -1159,6 +1233,8 @@ class ClimbGenerator:
                         continue
                     max_reach = MAX_HAND_REACH
                 else:  # RF / LF
+                    if role_id not in {15}:  # feet must go to foot holds only
+                        continue
                     if hold_id in used_hold_ids and role_id != 14:
                         continue
                     max_reach = MAX_FOOT_REACH
