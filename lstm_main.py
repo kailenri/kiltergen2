@@ -70,6 +70,12 @@ def setup_parser():
         "--tb-logdir",
         help="TensorBoard log directory (optional)",
     )
+    train_parser.add_argument(
+        "--reinforce-weight",
+        type=float,
+        default=0.0,
+        help="Weight for REINFORCE policy-gradient loss (0=disabled). Recommended 0.01–0.05.",
+    )
     
 
     gen_parser = subparsers.add_parser("generate", help="Generate climbing sequences")
@@ -184,7 +190,8 @@ def train_model(args):
         save_path=args.output,
         checkpoint_dir=args.checkpoint_dir,
         checkpoint_freq=args.checkpoint_freq,
-        tb_logdir=args.tb_logdir
+        tb_logdir=args.tb_logdir,
+        reinforce_weight=args.reinforce_weight,
     )
     
     print(f"Training complete. Model saved to {args.output}")

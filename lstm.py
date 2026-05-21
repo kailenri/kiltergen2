@@ -351,6 +351,51 @@ class FocalLoss(nn.Module):
         pt = torch.exp(-ce_loss)
         return ((1 - pt) ** self.gamma * ce_loss).mean()
 
+
+class HoldEncoder(nn.Module):
+    """Factorised spatial encoder for (hold, limb) token pairs.
+
+    Rather than projecting a flat 10-dim per-token feature vector that
+    duplicates hold geometry across all four limbs on the same hold, this
+    module learns a hold-level representation shared across limbs and
+    combines it with a learned kinematic limb embedding.
+
+    Architecture:
+        hold_mlp : (hold_feat_dim=6) → 32 → hold_embed_dim  (per physical hold)
+        limb_emb : Embedding(4, limb_embed_dim)              (per kinematic limb)
+        output   : cat(hold_emb, limb_emb)  →  hold_embed_dim + limb_embed_dim
+    """
+
+    def __init__(
+        self,
+        hold_feat_dim: int = 6,
+        hold_embed_dim: int = 32,
+        num_limbs: int = 4,
+        limb_embed_dim: int = 8,
+    ):
+        super().__init__()
+        self.hold_mlp = nn.Sequential(
+            nn.Linear(hold_feat_dim, 32),
+            nn.ReLU(),
+            nn.Linear(32, hold_embed_dim),
+            nn.ReLU(),
+        )
+        self.limb_embedding = nn.Embedding(num_limbs, limb_embed_dim)
+        self.output_dim = hold_embed_dim + limb_embed_dim
+
+    def forward(self, hold_features: torch.Tensor, limb_indices: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            hold_features : (..., hold_feat_dim) float — spatial hold attributes
+            limb_indices  : (...) long — 0=RH, 1=LH, 2=RF, 3=LF
+        Returns:
+            (..., output_dim) float
+        """
+        hold_emb = self.hold_mlp(hold_features)       # (..., hold_embed_dim)
+        limb_emb = self.limb_embedding(limb_indices)   # (..., limb_embed_dim)
+        return torch.cat([hold_emb, limb_emb], dim=-1) # (..., output_dim)
+
+
 class ClimbLSTM(nn.Module):
     def __init__(self, vocab_size, embedding_dim=128, hidden_dim=256, num_layers=2, dropout=0.2,
                  spatial_features=None, spatial_proj_dim=32,
@@ -361,21 +406,36 @@ class ClimbLSTM(nn.Module):
         self.hidden_dim = hidden_dim
         self.embedding = nn.Embedding(vocab_size, embedding_dim, padding_idx=0)
 
-        # Optional spatial feature branch: projects per-token [x, y, role, limb]
-        # features into a compact embedding concatenated with the token embedding.
-        # Using a registered buffer so it is saved/restored with the model but
-        # not updated by the optimiser.
+        # Spatial branch: HoldEncoder factorises spatial conditioning into a
+        # hold-level MLP (shared across all limbs on the same hold) and a
+        # learned limb identity embedding, replacing the flat per-token
+        # spatial_proj with a more expressive, parameter-efficient module.
+        #
+        # hold_features buffer: (vocab_size, 6) = first 6 dims of spatial_features
+        #   [x_norm, y_norm, role_start, role_hand, role_finish, role_foot]
+        # Limb identity is captured by HoldEncoder's own Embedding rather than
+        # the last 4 one-hot columns of the original 10-dim feature.
+        _HOLD_FEAT_DIM  = 6
+        _HOLD_EMBED_DIM = 32
+        _LIMB_EMBED_DIM = 8
         lstm_input_dim = embedding_dim
         if spatial_features is not None:
-            self.register_buffer('spatial_features', spatial_features)
-            self.spatial_proj = nn.Sequential(
-                nn.Linear(spatial_features.shape[1], spatial_proj_dim),
-                nn.ReLU(),
+            hold_feats = spatial_features[:, :_HOLD_FEAT_DIM].clone()
+            self.register_buffer('hold_features', hold_feats)  # (vocab_size, 6)
+            self.hold_encoder = HoldEncoder(
+                hold_feat_dim=_HOLD_FEAT_DIM,
+                hold_embed_dim=_HOLD_EMBED_DIM,
+                num_limbs=4,
+                limb_embed_dim=_LIMB_EMBED_DIM,
             )
-            lstm_input_dim = embedding_dim + spatial_proj_dim
+            lstm_input_dim = embedding_dim + self.hold_encoder.output_dim  # 128+40=168
         else:
-            self.spatial_features = None
-            self.spatial_proj = None
+            self.hold_features = None
+            self.hold_encoder  = None
+        # Kept as None so any code that checks spatial_proj / spatial_features
+        # will not crash when loading a Phase D checkpoint.
+        self.spatial_features = None
+        self.spatial_proj     = None
 
         self.lstm = nn.LSTM(
             lstm_input_dim, hidden_dim,
@@ -419,6 +479,8 @@ class ClimbLSTM(nn.Module):
         self.embedding.weight.data.uniform_(-init_range, init_range)
         self.fc.weight.data.uniform_(-init_range, init_range)
         self.fc.bias.data.zero_()
+        if self.hold_encoder is not None:
+            self.hold_encoder.limb_embedding.weight.data.uniform_(-init_range, init_range)
         if self.fc_hold is not None:
             self.fc_hold.weight.data.uniform_(-init_range, init_range)
             self.fc_hold.bias.data.zero_()
@@ -428,10 +490,10 @@ class ClimbLSTM(nn.Module):
     def forward(self, x, hidden=None, difficulty=None, return_aux=False):
         embedded = self.embedding(x)
 
-        if self.spatial_features is not None and self.spatial_proj is not None:
-            # x: (batch, seq_len) — index directly into the buffer
-            spatial_raw = self.spatial_features[x]          # (batch, seq_len, feat_dim)
-            spatial_emb = self.spatial_proj(spatial_raw)    # (batch, seq_len, proj_dim)
+        if self.hold_features is not None and self.hold_encoder is not None:
+            hold_feat   = self.hold_features[x]                     # (batch, seq_len, 6)
+            limb_idx    = (x - 1).clamp(min=0) % 4                 # (batch, seq_len) long
+            spatial_emb = self.hold_encoder(hold_feat, limb_idx)   # (batch, seq_len, 40)
             embedded = torch.cat([embedded, spatial_emb], dim=-1)
 
         # Condition initial hidden state on difficulty (first step only — when
@@ -545,7 +607,7 @@ class ClimbGenerator:
             print(f"Error loading model: {e}")
             return False
 
-    def train(self, num_epochs=30, batch_size=32, learning_rate=0.001, save_path='lstm_model.pth', checkpoint_dir=None, checkpoint_freq=5, tb_logdir=None):
+    def train(self, num_epochs=30, batch_size=32, learning_rate=0.001, save_path='lstm_model.pth', checkpoint_dir=None, checkpoint_freq=5, tb_logdir=None, reinforce_weight=0.0):
         train_data, val_data = train_test_split(self.dataset, test_size=0.2, random_state=42, shuffle=True)
         
         #Set up data loaders
@@ -606,7 +668,7 @@ class ClimbGenerator:
             epoch_loss = 0
             
             progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}")
-            for inputs, targets, difficulties in progress_bar:
+            for batch_idx, (inputs, targets, difficulties) in enumerate(progress_bar):
                 inputs, targets, difficulties = inputs.to(device), targets.to(device), difficulties.to(device)
                 
                 #Raise on invalid tokens — catches data pipeline bugs early
@@ -672,7 +734,17 @@ class ClimbGenerator:
                 
                 optimizer.step()
                 scheduler.step()
-                
+
+                # REINFORCE step: every 10 batches when reinforce_weight > 0.
+                # Separate backward pass so CE gradients are not disturbed.
+                if reinforce_weight > 0.0 and batch_idx % 10 == 0:
+                    rl_loss = self._compute_reinforce_loss(device)
+                    if rl_loss is not None:
+                        optimizer.zero_grad()
+                        (reinforce_weight * rl_loss).backward()
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), 0.5)
+                        optimizer.step()
+
                 epoch_loss += loss.item()
                 progress_bar.set_postfix({"loss": f"{loss.item():.4f}"})
             
@@ -1498,6 +1570,146 @@ class ClimbGenerator:
             if ((y0 > y) != (y1 > y)) and (x < (x1 - x0) * (y - y0) / (y1 - y0 + 1e-12) + x0):
                 inside = not inside
         return inside
+
+    # ------------------------------------------------------------------
+    # REINFORCE helpers
+    # ------------------------------------------------------------------
+
+    def _compute_reinforce_loss(self, device):
+        """REINFORCE episode: sample a sequence, score it, return policy-gradient loss.
+
+        Two-phase approach for MPS compatibility and numerical stability:
+          Phase 1 — sample tokens with torch.no_grad() (no autograd graph built).
+          Phase 2 — recompute log-probs in ONE teacher-forced forward pass with
+                    gradients, so the autograd graph is shallow and MPS-safe.
+        """
+        climb_ids = list(self.climb_data.keys())
+        if not climb_ids:
+            return None
+
+        climb_id     = random.choice(climb_ids)
+        climb        = self.climb_data.get(climb_id, {})
+        hold_map     = {h['hole_id']: h for h in climb.get('holds', [])}
+        finish_holds = {h['hole_id'] for h in climb.get('holds', []) if h.get('role_id') == 14}
+        start_holds  = [h['hole_id'] for h in climb.get('holds', []) if h.get('role_id') == 12]
+
+        if not start_holds or not finish_holds:
+            return None
+
+        # Build seed tokens from start holds (up to 2).
+        n_limbs     = len(self.dataset.limb_mapping)
+        init_tokens = []
+        for i, hold_id in enumerate(start_holds[:2]):
+            ht = self.dataset.hold_mapping.get(hold_id)
+            if ht is None:
+                continue
+            lt = self.dataset.limb_mapping.get('RH' if i == 0 else 'LH', i)
+            init_tokens.append((ht * n_limbs) + lt + 1)
+
+        if not init_tokens:
+            return None
+
+        # ----------------------------------------------------------------
+        # Phase 1: autoregressively sample a sequence — no autograd graph.
+        # ----------------------------------------------------------------
+        sampled_tokens = list(init_tokens)
+        was_training   = self.model.training
+        self.model.eval()
+        try:
+            with torch.no_grad():
+                input_seq      = torch.tensor([init_tokens], dtype=torch.long).to(device)
+                output, hidden = self.model(input_seq)
+
+                for _ in range(20):
+                    logits    = output[0, -1, :].clone()
+                    logits[0] = float('-inf')
+                    probs     = F.softmax(logits, dim=-1)
+
+                    # Guard against degenerate distributions on MPS.
+                    if not probs.isfinite().all() or probs.sum() <= 0:
+                        break
+
+                    next_token = torch.multinomial(probs, num_samples=1).item()
+                    sampled_tokens.append(next_token)
+
+                    if next_token == 0:
+                        break
+
+                    t          = next_token - 1
+                    hold_token = t // n_limbs
+                    hold_id    = self.dataset.reverse_hold_mapping.get(hold_token)
+                    if hold_map.get(hold_id, {}).get('role_id') == 14:
+                        break
+
+                    input_seq      = torch.tensor([[next_token]], dtype=torch.long).to(device)
+                    output, hidden = self.model(input_seq, hidden)
+        finally:
+            if was_training:
+                self.model.train()
+
+        if len(sampled_tokens) <= len(init_tokens):
+            return None  # nothing was sampled
+
+        # ----------------------------------------------------------------
+        # Compute reward.
+        # ----------------------------------------------------------------
+        decoded   = self.dataset.decode_sequence(sampled_tokens)
+        reward    = self._compute_sequence_reward(decoded, climb_id)
+        advantage = reward - 0.5  # fixed baseline: midpoint of [0, 1]
+
+        if advantage == 0.0:
+            return None  # no signal; skip
+
+        # ----------------------------------------------------------------
+        # Phase 2: recompute log-probs in ONE teacher-forced forward pass.
+        # Output at position t predicts sampled_tokens[t+1], so the
+        # log-prob of the k-th sampled token (index n_seed+k in the full
+        # list) is at output position n_seed+k-1.
+        # ----------------------------------------------------------------
+        n_seed = len(init_tokens)
+        x      = torch.tensor([sampled_tokens[:-1]], dtype=torch.long).to(device)
+        output_all, _ = self.model(x)  # (1, len-1, vocab_size) — grad flows here
+
+        log_probs = []
+        for t_offset, tok in enumerate(sampled_tokens[n_seed:]):
+            if tok == 0:
+                break
+            t_in = (n_seed - 1) + t_offset
+            if t_in >= output_all.shape[1]:
+                break
+            lp = F.log_softmax(output_all[0, t_in, :], dim=-1)[tok]
+            log_probs.append(lp)
+
+        if not log_probs:
+            return None
+
+        return -torch.stack(log_probs).mean() * advantage
+
+    def _compute_sequence_reward(self, decoded, climb_id):
+        """Scalar reward in [0, 1] measuring generated sequence quality.
+
+        Components (weights sum to 1.0):
+          R_finish      (0.5): whether the last two moves include a finish hold
+          R_alternation (0.3): fraction of consecutive hand pairs that alternate
+          R_length      (0.2): reaches at least 6 moves (min viable sequence)
+        """
+        if not decoded:
+            return 0.0
+
+        climb        = self.climb_data.get(climb_id, {})
+        finish_holds = {h['hole_id'] for h in climb.get('holds', []) if h.get('role_id') == 14}
+
+        r_finish = 1.0 if finish_holds and any(
+            m['hold'] in finish_holds for m in decoded[-2:]
+        ) else 0.0
+
+        hands  = [m['limb'] for m in decoded if m.get('limb') in ('RH', 'LH')]
+        n_alt  = sum(1 for i in range(1, len(hands)) if hands[i] != hands[i - 1])
+        r_alternation = n_alt / (len(hands) - 1) if len(hands) > 1 else 0.0
+
+        r_length = min(1.0, len(decoded) / 6.0)
+
+        return 0.5 * r_finish + 0.3 * r_alternation + 0.2 * r_length
 
     def visualize_sequence(self, sequence, climb_id=None, save_path=None, viz_type='path'):
         if not sequence:
