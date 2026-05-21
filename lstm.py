@@ -354,7 +354,8 @@ class FocalLoss(nn.Module):
 class ClimbLSTM(nn.Module):
     def __init__(self, vocab_size, embedding_dim=128, hidden_dim=256, num_layers=2, dropout=0.2,
                  spatial_features=None, spatial_proj_dim=32,
-                 num_difficulty_buckets=0, difficulty_embed_dim=16):
+                 num_difficulty_buckets=0, difficulty_embed_dim=16,
+                 num_holds=0):
         super().__init__()
         self.num_layers = num_layers
         self.hidden_dim = hidden_dim
@@ -389,6 +390,15 @@ class ClimbLSTM(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.fc = nn.Linear(hidden_dim, vocab_size)
 
+        # Auxiliary output heads: separate hold and limb predictors provide
+        # factorised gradient signal during training without changing inference.
+        if num_holds > 0:
+            self.fc_hold = nn.Linear(hidden_dim, num_holds)
+            self.fc_limb = nn.Linear(hidden_dim, 4)
+        else:
+            self.fc_hold = None
+            self.fc_limb = None
+
         # Difficulty conditioning: condition the LSTM's initial (h, c) on a
         # bucketed difficulty level.  Padding index 0 = 'unknown' → zero vector.
         if num_difficulty_buckets > 0:
@@ -409,8 +419,13 @@ class ClimbLSTM(nn.Module):
         self.embedding.weight.data.uniform_(-init_range, init_range)
         self.fc.weight.data.uniform_(-init_range, init_range)
         self.fc.bias.data.zero_()
+        if self.fc_hold is not None:
+            self.fc_hold.weight.data.uniform_(-init_range, init_range)
+            self.fc_hold.bias.data.zero_()
+            self.fc_limb.weight.data.uniform_(-init_range, init_range)
+            self.fc_limb.bias.data.zero_()
 
-    def forward(self, x, hidden=None, difficulty=None):
+    def forward(self, x, hidden=None, difficulty=None, return_aux=False):
         embedded = self.embedding(x)
 
         if self.spatial_features is not None and self.spatial_proj is not None:
@@ -429,7 +444,10 @@ class ClimbLSTM(nn.Module):
 
         lstm_out, hidden = self.lstm(embedded, hidden)
         out = self.dropout(self.layer_norm(lstm_out))
-        return self.fc(out), hidden
+        composite = self.fc(out)
+        if return_aux and self.fc_hold is not None:
+            return composite, self.fc_hold(out), self.fc_limb(out), hidden
+        return composite, hidden
 
 class EarlyStopping:
     def __init__(self, patience=7, min_delta=0.001, restore_best_weights=True):
@@ -513,6 +531,7 @@ class ClimbGenerator:
                 dropout=0.2,
                 spatial_features=self.dataset.build_spatial_features(),
                 num_difficulty_buckets=NUM_DIFFICULTY_BUCKETS,
+                num_holds=len(self.dataset.hold_mapping),
             ).to(device)
             
             state_dict = torch.load(model_path, map_location=device)
@@ -550,6 +569,7 @@ class ClimbGenerator:
             dropout=0.2,
             spatial_features=self.dataset.build_spatial_features(),
             num_difficulty_buckets=NUM_DIFFICULTY_BUCKETS,
+            num_holds=len(self.dataset.hold_mapping),
         ).to(device)
         
         #Set up loss, optimizer and schedulers
@@ -598,8 +618,53 @@ class ClimbGenerator:
                     )
                 
                 optimizer.zero_grad()
-                outputs, _ = self.model(inputs, difficulty=difficulties)
-                loss = criterion(outputs.reshape(-1, self.dataset.vocab_size), targets.reshape(-1))
+
+                # Scheduled sampling: teacher-forcing ratio decays linearly
+                # from 1.0 → 0.5 over training, reducing exposure bias.
+                tf_ratio = max(0.5, 1.0 - 0.5 * epoch / num_epochs)
+                seq_len = inputs.shape[1]
+                hidden = None
+                logits_list, hold_list, limb_list = [], [], []
+                current_input = inputs[:, 0:1]
+                for t in range(seq_len):
+                    logit_t, hold_t, limb_t, hidden = self.model(
+                        current_input, hidden, difficulty=difficulties, return_aux=True
+                    )
+                    logits_list.append(logit_t)
+                    hold_list.append(hold_t)
+                    limb_list.append(limb_t)
+                    if t < seq_len - 1:
+                        if random.random() < tf_ratio:
+                            current_input = inputs[:, t + 1:t + 2]
+                        else:
+                            with torch.no_grad():
+                                current_input = logit_t.argmax(dim=-1)
+
+                outputs     = torch.cat(logits_list, dim=1)
+                hold_logits = torch.cat(hold_list,   dim=1)
+                limb_logits = torch.cat(limb_list,   dim=1)
+
+                loss_main = criterion(
+                    outputs.reshape(-1, self.dataset.vocab_size), targets.reshape(-1)
+                )
+
+                # Auxiliary factorised losses on non-PAD positions.
+                # Encoding: token = (hold_token * 4) + limb_token + 1
+                # → hold_token = (token-1)//4,  limb_token = (token-1)%4
+                num_holds = len(self.dataset.hold_mapping)
+                hold_targets = torch.zeros_like(targets)
+                limb_targets = torch.full_like(targets, -1)
+                valid_mask = targets > 0
+                hold_targets[valid_mask] = (targets[valid_mask] - 1) // 4
+                limb_targets[valid_mask] = (targets[valid_mask] - 1) % 4
+                loss_hold = F.cross_entropy(
+                    hold_logits.reshape(-1, num_holds), hold_targets.reshape(-1), ignore_index=0
+                )
+                loss_limb = F.cross_entropy(
+                    limb_logits.reshape(-1, 4), limb_targets.reshape(-1), ignore_index=-1
+                )
+
+                loss = loss_main + 0.3 * loss_hold + 0.3 * loss_limb
                 loss.backward()
                 
                 #Gradient clipping
