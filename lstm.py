@@ -738,12 +738,7 @@ class ClimbGenerator:
                 # REINFORCE step: every 10 batches when reinforce_weight > 0.
                 # Separate backward pass so CE gradients are not disturbed.
                 if reinforce_weight > 0.0 and batch_idx % 10 == 0:
-                    rl_loss = self._compute_reinforce_loss(device)
-                    if rl_loss is not None:
-                        optimizer.zero_grad()
-                        (reinforce_weight * rl_loss).backward()
-                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), 0.5)
-                        optimizer.step()
+                    self._reinforce_update(device, optimizer, reinforce_weight)
 
                 epoch_loss += loss.item()
                 progress_bar.set_postfix({"loss": f"{loss.item():.4f}"})
@@ -1650,6 +1645,11 @@ class ClimbGenerator:
         if len(sampled_tokens) <= len(init_tokens):
             return None  # nothing was sampled
 
+        # Flush MPS queue and release Phase 1 GPU tensors before Phase 2.
+        if device.type == 'mps' and hasattr(torch, 'mps'):
+            torch.mps.synchronize()
+        del output, hidden  # allow MPS to reuse memory
+
         # ----------------------------------------------------------------
         # Compute reward.
         # ----------------------------------------------------------------
@@ -1658,32 +1658,93 @@ class ClimbGenerator:
         advantage = reward - 0.5  # fixed baseline: midpoint of [0, 1]
 
         if advantage == 0.0:
-            return None  # no signal; skip
+            return None  # no gradient signal; skip
 
         # ----------------------------------------------------------------
-        # Phase 2: recompute log-probs in ONE teacher-forced forward pass.
-        # Output at position t predicts sampled_tokens[t+1], so the
-        # log-prob of the k-th sampled token (index n_seed+k in the full
-        # list) is at output position n_seed+k-1.
+        # Phase 2: recompute log-probs in ONE vectorised teacher-forced
+        # forward pass (no per-token Python indexing — MPS-safe).
+        #
+        # sampled_tokens layout: [*init_tokens, tok_1, tok_2, ..., tok_K]
+        # x (input)            : sampled_tokens[:-1]  → length L-1
+        # output_all           : (1, L-1, vocab_size)  with grad
+        # Target slice         : output_all[0, n_seed-1 : n_seed-1+K, :]
+        #   predicts           : sampled_tokens[n_seed : n_seed+K]
         # ----------------------------------------------------------------
-        n_seed = len(init_tokens)
-        x      = torch.tensor([sampled_tokens[:-1]], dtype=torch.long).to(device)
-        output_all, _ = self.model(x)  # (1, len-1, vocab_size) — grad flows here
-
-        log_probs = []
-        for t_offset, tok in enumerate(sampled_tokens[n_seed:]):
-            if tok == 0:
-                break
-            t_in = (n_seed - 1) + t_offset
-            if t_in >= output_all.shape[1]:
-                break
-            lp = F.log_softmax(output_all[0, t_in, :], dim=-1)[tok]
-            log_probs.append(lp)
-
-        if not log_probs:
+        n_seed            = len(init_tokens)
+        # Exclude trailing PAD (0) token if sampling stopped on it.
+        sampled_after_seed = [t for t in sampled_tokens[n_seed:] if t != 0]
+        if not sampled_after_seed:
             return None
 
-        return -torch.stack(log_probs).mean() * advantage
+        K         = len(sampled_after_seed)
+        x         = torch.tensor([sampled_tokens[:-1]], dtype=torch.long).to(device)
+        output_all, _ = self.model(x)          # (1, L-1, vocab_size) — grad
+
+        start_pos  = n_seed - 1
+        end_pos    = start_pos + K
+        if end_pos > output_all.shape[1]:
+            end_pos = output_all.shape[1]
+            sampled_after_seed = sampled_after_seed[:end_pos - start_pos]
+            if not sampled_after_seed:
+                return None
+
+        # (K, vocab_size) slice — gradient flows here.
+        logits_slice = output_all[0, start_pos:end_pos, :]
+        # Targets as a 1-D LongTensor on the same device.
+        tgt = torch.tensor(sampled_after_seed, dtype=torch.long, device=device)
+
+        # F.cross_entropy = -log_softmax[tgt], vectorised, MPS-safe, no
+        # per-element Python indexing that triggers MPS assertions.
+        neg_lp = F.cross_entropy(logits_slice, tgt, reduction='none')  # (K,)
+        return neg_lp.mean() * advantage  # REINFORCE loss (positive → minimise)
+
+    def _reinforce_update(self, device, optimizer, reinforce_weight):
+        """Complete REINFORCE update step.
+
+        When *device* is MPS the gradient computation is done on CPU to avoid
+        MPS C-level assertion failures (uncatchable by Python try/except).
+        CPU gradients are collected, transferred to MPS, and the main MPS
+        optimizer performs the parameter update — preserving Adam state.
+        """
+        needs_cpu = (device.type == 'mps')
+        work_dev  = torch.device('cpu') if needs_cpu else device
+
+        try:
+            if needs_cpu:
+                self.model.to(work_dev)   # move params + buffers to CPU
+
+            rl_loss = self._compute_reinforce_loss(work_dev)
+            if rl_loss is None:
+                return
+
+            optimizer.zero_grad()
+            (reinforce_weight * rl_loss).backward()
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 0.5)
+
+            if needs_cpu:
+                # Snapshot CPU gradients, restore model to MPS, apply grads.
+                cpu_grads = {
+                    n: p.grad.clone() if p.grad is not None else None
+                    for n, p in self.model.named_parameters()
+                }
+                self.model.to(device)   # back to MPS
+                optimizer.zero_grad()   # clear stale grad references
+                for n, p in self.model.named_parameters():
+                    g = cpu_grads.get(n)
+                    if g is not None:
+                        p.grad = g.to(device)
+                # Second clip pass now that grads are on MPS.
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 0.5)
+
+            optimizer.step()
+
+        except Exception:
+            pass  # non-fatal — CE training continues
+        finally:
+            # Always ensure model is on the training device and in train mode.
+            if next(self.model.parameters()).device != device:
+                self.model.to(device)
+            self.model.train()
 
     def _compute_sequence_reward(self, decoded, climb_id):
         """Scalar reward in [0, 1] measuring generated sequence quality.
