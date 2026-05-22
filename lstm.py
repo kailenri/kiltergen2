@@ -13,7 +13,22 @@ import matplotlib.pyplot as plt
 import random
 from torch.nn import functional as F
 from viz import plot_climb_sequence, plot_sequence_cycle, plot_reachability_map, plot_hold_density
-from config import MAX_HAND_REACH, MAX_FOOT_REACH, X_SPACING
+from config import (
+    MAX_HAND_REACH,
+    MAX_FOOT_REACH,
+    X_SPACING,
+    FOOT_CUT_ENABLED,
+    FOOT_REPLANT_MAX_STEPS,
+)
+from kinematics import (
+    estimate_hip as _kin_estimate_hip,
+    estimate_shoulder as _kin_estimate_shoulder,
+    ellipse_dnorm as _kin_ellipse_dnorm,
+    convex_hull as _kin_convex_hull,
+    point_in_poly as _kin_point_in_poly,
+    is_dynamic_hand_move,
+    choose_cut_foot,
+)
 
 # ---------------------------------------------------------------------------
 # Difficulty conditioning helpers
@@ -1044,6 +1059,7 @@ class ClimbGenerator:
             current_tokens = []
             limb_positions = {'RH': None, 'LH': None, 'RF': None, 'LF': None}
             used_hold_ids = set()
+            cut_feet = set()
             for hold_id, limb in start_holds:
                 if hold_id in self.dataset.hold_mapping:
                     hold_token = self.dataset.hold_mapping[hold_id]
@@ -1134,13 +1150,24 @@ class ClimbGenerator:
                         # Constrained decoding: mask all invalid tokens in one
                         # O(|climb_holds| × 4) pass — no rejection loop needed.
                         valid_mask = self._build_valid_token_mask(
-                            limb_positions, last_hand, hold_map, used_hold_ids
+                            limb_positions, last_hand, hold_map, used_hold_ids, cut_feet
                         )
                         device_mask = valid_mask.to(logits.device)
                         logits[~device_mask] = float('-inf')
 
                         if not device_mask.any():
-                            break
+                            # Replant deadlock: no cut foot can reach any hold.
+                            # Treat as toe-match — clear cut_feet and rebuild
+                            # the mask so generation can continue with hands.
+                            if cut_feet:
+                                cut_feet.clear()
+                                valid_mask = self._build_valid_token_mask(
+                                    limb_positions, last_hand, hold_map, used_hold_ids, cut_feet
+                                )
+                                device_mask = valid_mask.to(logits.device)
+                                logits[~device_mask] = float('-inf')
+                            if not device_mask.any():
+                                break
 
                         # Top-p (nucleus) sampling within the valid set
                         sorted_logits, sorted_indices = torch.sort(logits, descending=True)
@@ -1156,10 +1183,33 @@ class ClimbGenerator:
 
                         move = decode_token(next_token)
                         if move:
-                            limb_positions[move['limb']] = (move.get('x', 0), move.get('y', 0))
+                            mv_limb = move['limb']
+                            new_xy = (move.get('x', 0), move.get('y', 0))
+
+                            # Foot-cut / replant bookkeeping mirroring the beam
+                            # generator: a dynamic hand move may cut a foot,
+                            # and the next foot move re-plants it.
+                            if FOOT_CUT_ENABLED:
+                                if mv_limb in ('RH', 'LH'):
+                                    prev_hand_xy = limb_positions[mv_limb]
+                                    foot_xys = [limb_positions[f] for f in ('RF', 'LF')
+                                                if limb_positions[f] is not None]
+                                    other_hand = 'LH' if mv_limb == 'RH' else 'RH'
+                                    other_hand_xy = limb_positions[other_hand]
+                                    if is_dynamic_hand_move(prev_hand_xy, new_xy, foot_xys,
+                                                            mv_limb, other_hand_xy):
+                                        foot_dict = {f: limb_positions[f] for f in ('RF', 'LF')}
+                                        cut = choose_cut_foot(mv_limb, foot_dict)
+                                        if cut is not None:
+                                            cut_feet.add(cut)
+                                            limb_positions[cut] = None
+                                elif mv_limb in cut_feet:
+                                    cut_feet.discard(mv_limb)
+
+                            limb_positions[mv_limb] = new_xy
                             used_hold_ids.add(move.get('hold'))
-                            if move['limb'] in ('RH', 'LH'):
-                                last_hand = move['limb']
+                            if mv_limb in ('RH', 'LH'):
+                                last_hand = mv_limb
 
                             # Stop immediately if we landed on a finish hold.
                             if move.get('role_id') == 14:
@@ -1331,15 +1381,20 @@ class ClimbGenerator:
         
         return reachable
 
-    def _build_valid_token_mask(self, limb_positions, last_hand, hold_map, used_hold_ids):
+    def _build_valid_token_mask(self, limb_positions, last_hand, hold_map, used_hold_ids, cut_feet=None):
         """Build a boolean mask of shape (vocab_size,) where True marks a token as a
         valid next move.  Replaces the 30-attempt rejection-sampling loop with a
         single O(|climb_holds| × 4) pass that writes directly into the logit tensor
         before sampling.
+
+        When ``cut_feet`` is non-empty and ``FOOT_CUT_ENABLED`` is True, only foot
+        re-plants for the cut limbs are allowed (hand tokens are masked) so that
+        the climber must restore foot tension before reaching again.
         """
         n_limbs = len(self.dataset.limb_mapping)
         vocab_size = self.dataset.vocab_size
         valid = torch.zeros(vocab_size, dtype=torch.bool)
+        gate_active = bool(cut_feet) and FOOT_CUT_ENABLED
 
         for hold in hold_map.values():
             hold_id = hold.get('hole_id')
@@ -1354,6 +1409,8 @@ class ClimbGenerator:
 
             for limb_name, limb_token in self.dataset.limb_mapping.items():
                 if limb_name in ('RH', 'LH'):
+                    if gate_active:
+                        continue  # hands blocked until cut feet are replanted
                     if role_id not in {12, 13, 14}:
                         continue
                     if last_hand == limb_name:
@@ -1365,6 +1422,8 @@ class ClimbGenerator:
                         continue
                     max_reach = MAX_HAND_REACH
                 else:  # RF / LF
+                    if gate_active and limb_name not in cut_feet:
+                        continue
                     if role_id not in {15}:  # feet must go to foot holds only
                         continue
                     if hold_id in used_hold_ids and role_id != 14:
@@ -1520,51 +1579,19 @@ class ClimbGenerator:
         print(f"Reachability reject: limb={limb} hold={hold_id} reason={reason}")
 
     def _estimate_hip(self, foot_positions):
-        arr = np.array(foot_positions)
-        return (float(np.mean(arr[:, 0])), float(np.mean(arr[:, 1])))
+        return _kin_estimate_hip(list(foot_positions))
 
     def _estimate_shoulder(self, hip_xy):
-        return (hip_xy[0], hip_xy[1] + X_SPACING * 2.0)
+        return _kin_estimate_shoulder(hip_xy)
 
     def _ellipse_dnorm(self, hold_xy, shoulder_xy, rx, ry):
-        dx = (hold_xy[0] - shoulder_xy[0]) / rx
-        dy = (hold_xy[1] - shoulder_xy[1]) / ry
-        return math.hypot(dx, dy)
+        return _kin_ellipse_dnorm(hold_xy, shoulder_xy, rx, ry)
 
     def _convex_hull(self, points):
-        pts = sorted(set(points))
-        if len(pts) <= 1:
-            return pts
-
-        def cross(o, a, b):
-            return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
-
-        lower = []
-        for p in pts:
-            while len(lower) >= 2 and cross(lower[-2], lower[-1], p) <= 0:
-                lower.pop()
-            lower.append(p)
-
-        upper = []
-        for p in reversed(pts):
-            while len(upper) >= 2 and cross(upper[-2], upper[-1], p) <= 0:
-                upper.pop()
-            upper.append(p)
-
-        return lower[:-1] + upper[:-1]
+        return _kin_convex_hull(points)
 
     def _point_in_poly(self, pt, poly):
-        if not poly:
-            return False
-        x, y = pt
-        inside = False
-        n = len(poly)
-        for i in range(n):
-            x0, y0 = poly[i]
-            x1, y1 = poly[(i + 1) % n]
-            if ((y0 > y) != (y1 > y)) and (x < (x1 - x0) * (y - y0) / (y1 - y0 + 1e-12) + x0):
-                inside = not inside
-        return inside
+        return _kin_point_in_poly(pt, poly)
 
     # ------------------------------------------------------------------
     # REINFORCE helpers

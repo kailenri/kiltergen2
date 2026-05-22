@@ -9,6 +9,15 @@ from itertools import chain
 from time import perf_counter
 from tqdm.auto import tqdm
 from config import *
+from kinematics import (
+    estimate_hip as _kin_estimate_hip,
+    estimate_shoulder as _kin_estimate_shoulder,
+    ellipse_dnorm as _kin_ellipse_dnorm,
+    convex_hull as _kin_convex_hull,
+    point_in_poly as _kin_point_in_poly,
+    is_dynamic_hand_move,
+    choose_cut_foot,
+)
 
 class ClimbSequenceGenerator:
     def __init__(self, holds_data: List[Dict], num_workers: int = 4):
@@ -63,57 +72,19 @@ class ClimbSequenceGenerator:
         return positions
 
     def _estimate_hip(self, foot_positions: List[Tuple[float, float]]):
-        if not foot_positions:
-            return None
-        arr = np.array(foot_positions)
-        return tuple(np.mean(arr, axis=0))
+        return _kin_estimate_hip(foot_positions)
 
     def _estimate_shoulder(self, hip_xy: Tuple[float, float]):
-        # shoulder offset upward; tuned relative to X_SPACING
-        shoulder_offset = X_SPACING * 2.0
-        return (hip_xy[0], hip_xy[1] + shoulder_offset)
+        return _kin_estimate_shoulder(hip_xy)
 
     def _ellipse_dnorm(self, hold_xy: Tuple[float, float], shoulder_xy: Tuple[float, float], rx: float, ry: float) -> float:
-        dx = (hold_xy[0] - shoulder_xy[0]) / rx
-        dy = (hold_xy[1] - shoulder_xy[1]) / ry
-        return math.hypot(dx, dy)
+        return _kin_ellipse_dnorm(hold_xy, shoulder_xy, rx, ry)
 
     def _convex_hull(self, points: List[Tuple[float, float]]):
-        # Monotone chain convex hull (returns list of points on hull in CCW)
-        pts = sorted(set(points))
-        if len(pts) <= 1:
-            return pts
-
-        def cross(o, a, b):
-            return (a[0]-o[0])*(b[1]-o[1]) - (a[1]-o[1])*(b[0]-o[0])
-
-        lower = []
-        for p in pts:
-            while len(lower) >= 2 and cross(lower[-2], lower[-1], p) <= 0:
-                lower.pop()
-            lower.append(p)
-
-        upper = []
-        for p in reversed(pts):
-            while len(upper) >= 2 and cross(upper[-2], upper[-1], p) <= 0:
-                upper.pop()
-            upper.append(p)
-
-        return lower[:-1] + upper[:-1]
+        return _kin_convex_hull(points)
 
     def _point_in_poly(self, pt: Tuple[float, float], poly: List[Tuple[float, float]]) -> bool:
-        # ray casting algorithm; poly must be a list of (x,y)
-        if not poly:
-            return False
-        x, y = pt
-        inside = False
-        n = len(poly)
-        for i in range(n):
-            x0, y0 = poly[i]
-            x1, y1 = poly[(i+1) % n]
-            if ((y0 > y) != (y1 > y)) and (x < (x1 - x0) * (y - y0) / (y1 - y0 + 1e-12) + x0):
-                inside = not inside
-        return inside
+        return _kin_point_in_poly(pt, poly)
 
     def _compute_hand_reachability_matrix(self) -> np.ndarray:
         n = len(self.holds)
@@ -286,17 +257,55 @@ class ClimbSequenceGenerator:
             'triangular_support': 0.0,
             'hand_support': 0.0,
             'completion': 0.0,
+            'coverage': 0.0,
+            'foot_tension_recovery': 0.0,
         }
 
         limb_use = defaultdict(int)
         prev_limb = None
         limb_positions = {'RH': None, 'LH': None, 'RF': None, 'LF': None}
+        # Track simulated cut feet to score replant behavior. Mirrors the
+        # generator's beam-state cut_feet semantics so post-hoc evaluation
+        # rewards re-planting and penalizes proceeding with hands while cut.
+        cut_feet = set()
+        steps_since_cut = {}  # foot -> moves elapsed since cut
 
         for i, move in enumerate(sequence):
             hold = self.hold_dict.get(move['hold'])
             if not hold:
                 continue
             limb = move['limb']
+
+            # Foot-cut bookkeeping (BEFORE updating limb_positions).
+            if FOOT_CUT_ENABLED:
+                if limb in ('RH', 'LH'):
+                    prev_hand_xy = limb_positions[limb]
+                    new_hand_xy = (hold['x'], hold['y'])
+                    foot_xys = [limb_positions[f] for f in ('RF', 'LF')
+                                if limb_positions[f] is not None]
+                    other_hand = 'LH' if limb == 'RH' else 'RH'
+                    other_hand_xy = limb_positions[other_hand]
+                    if cut_feet:
+                        # Climber proceeded with a hand while a foot was cut.
+                        metrics['foot_tension_recovery'] -= 3.0
+                    if is_dynamic_hand_move(prev_hand_xy, new_hand_xy, foot_xys,
+                                            limb, other_hand_xy):
+                        foot_dict = {f: limb_positions[f] for f in ('RF', 'LF')}
+                        cut = choose_cut_foot(limb, foot_dict)
+                        if cut is not None:
+                            cut_feet.add(cut)
+                            steps_since_cut[cut] = 0
+                            limb_positions[cut] = None
+                elif limb in ('RF', 'LF') and limb in cut_feet:
+                    elapsed = steps_since_cut.get(limb, 0)
+                    if elapsed <= FOOT_REPLANT_MAX_STEPS:
+                        metrics['foot_tension_recovery'] += 2.0
+                    cut_feet.discard(limb)
+                    steps_since_cut.pop(limb, None)
+                # Age remaining cuts.
+                for f in list(steps_since_cut.keys()):
+                    steps_since_cut[f] += 1
+
             limb_positions[limb] = (hold['x'], hold['y'])
 
             # hold quality
@@ -364,6 +373,14 @@ class ClimbSequenceGenerator:
         last_move = sequence[-1]
         metrics['completion'] = 10.0 if self.hold_dict.get(last_move['hold'], {}).get('role_id') == 14 else 0.0
 
+        # coverage: fraction of required hand-role holds visited by a hand.
+        required_hand_ids = {h['hole_id'] for h in self.hand_holds}
+        if required_hand_ids:
+            visited_hand_ids = {m['hold'] for m in sequence
+                                if m['limb'] in ('RH', 'LH')}
+            metrics['coverage'] = 10.0 * (len(required_hand_ids & visited_hand_ids)
+                                          / len(required_hand_ids))
+
         # normalize metrics
         seq_len = len(sequence)
         if seq_len > 1:
@@ -378,14 +395,16 @@ class ClimbSequenceGenerator:
 
         # assemble weights
         weights = {
-            'hold_quality': 0.12,
-            'movement_efficiency': 0.16,
-            'limb_alternation': 0.15,
-            'body_position': 0.12,
-            'cross_prevention': 0.12,
-            'triangular_support': 0.12,
-            'hand_support': 0.11,
+            'hold_quality': 0.10,
+            'movement_efficiency': 0.13,
+            'limb_alternation': 0.12,
+            'body_position': 0.10,
+            'cross_prevention': 0.10,
+            'triangular_support': 0.10,
+            'hand_support': 0.10,
             'completion': 0.10,
+            'coverage': 0.10,
+            'foot_tension_recovery': 0.05,
         }
 
         total_score = 0.0
@@ -479,40 +498,92 @@ class ClimbSequenceGenerator:
                 for limb, hold in state['limbs'].items()
             ))
 
-            for limb in ['RH', 'LH']:
-                current = state['limbs'][limb]
-                current_id = current['hole_id'] if current else -1
+            cut_feet = state.get('cut_feet', frozenset())
+            # While any foot is cut by a prior dynamic hand move, the climber
+            # must re-plant it before any further hand reach. Mask out hand
+            # expansions entirely until cut_feet is empty.
+            hands_allowed = (not cut_feet) or (not FOOT_CUT_ENABLED)
 
-                for next_hold in self.hand_holds:
-                    next_id = next_hold['hole_id']
-                    if current_id != next_id and self.is_valid_hand_transition(
-                            current_id, next_id, limb, current_limbs_tuple):
-                        #new state with this hand movement
-                        new_limbs = {k: v for k, v in state['limbs'].items()}
-                        new_limbs[limb] = next_hold
-                        
-                        #calculate state score based on hold and quality
-                        move_score = 1
-                        if next_hold['role_id'] == 14: 
-                            move_score = 10
-                        elif next_hold['role_id'] == 12: 
-                            move_score = 5
-                            
-                        new_states.append({
-                            'sequence': state['sequence'] + [{
-                                'limb': limb,
-                                'hold': next_id,
-                                'position': next_hold.get('position')
-                            }],
-                            'limbs': new_limbs,
-                            'score': state['score'] + move_score
-                        })
-                        
+            # Pre-compute hands already visited so we can reward first-time coverage.
+            visited_hand_ids = {m['hold'] for m in state['sequence']
+                                if m['limb'] in ('RH', 'LH')}
+            finish_ids = {h['hole_id'] for h in self.finish_holds}
+            required_non_finish = {h['hole_id'] for h in self.hand_holds} - finish_ids
+
+            if hands_allowed:
+                for limb in ['RH', 'LH']:
+                    current = state['limbs'][limb]
+                    current_id = current['hole_id'] if current else -1
+                    if current_id != -1:
+                        visited_hand_ids.add(current_id)
+
+                    # Kilter convention: finish is touched last. Don't leave a finish hold,
+                    # and don't grab the finish until all other required hands are covered.
+                    if current_id in finish_ids:
+                        continue
+                    coverage_done = required_non_finish.issubset(visited_hand_ids)
+
+                    for next_hold in self.hand_holds:
+                        next_id = next_hold['hole_id']
+                        if next_id in finish_ids and not coverage_done:
+                            continue
+                        if current_id != next_id and self.is_valid_hand_transition(
+                                current_id, next_id, limb, current_limbs_tuple):
+                            #new state with this hand movement
+                            new_limbs = {k: v for k, v in state['limbs'].items()}
+                            new_limbs[limb] = next_hold
+
+                            #calculate state score based on hold and quality
+                            move_score = 1
+                            if next_hold['role_id'] == 14:
+                                move_score = 10
+                            elif next_hold['role_id'] == 12:
+                                move_score = 5
+                            # Coverage bonus: first time this hand-role hold is touched.
+                            if next_id not in visited_hand_ids:
+                                move_score += 8
+
+                            # Detect dynamic move and cut a foot if so.
+                            new_cut = cut_feet
+                            if FOOT_CUT_ENABLED:
+                                prev_hand_xy = (current['x'], current['y']) if current else None
+                                new_hand_xy = (next_hold['x'], next_hold['y'])
+                                foot_xys = [(state['limbs'][f]['x'], state['limbs'][f]['y'])
+                                            for f in ('RF', 'LF')
+                                            if state['limbs'].get(f) is not None]
+                                other_hand = 'LH' if limb == 'RH' else 'RH'
+                                other = state['limbs'].get(other_hand)
+                                other_hand_xy = (other['x'], other['y']) if other else None
+                                if is_dynamic_hand_move(prev_hand_xy, new_hand_xy, foot_xys,
+                                                        limb, other_hand_xy):
+                                    foot_dict = {f: ((state['limbs'][f]['x'], state['limbs'][f]['y'])
+                                                     if state['limbs'].get(f) else None)
+                                                 for f in ('RF', 'LF')}
+                                    cut = choose_cut_foot(limb, foot_dict)
+                                    if cut is not None:
+                                        new_limbs[cut] = None
+                                        new_cut = frozenset({cut})
+
+                            new_states.append({
+                                'sequence': state['sequence'] + [{
+                                    'limb': limb,
+                                    'hold': next_id,
+                                    'position': next_hold.get('position')
+                                }],
+                                'limbs': new_limbs,
+                                'cut_feet': new_cut,
+                                'score': state['score'] + move_score
+                            })
+
             #feeeet
             for limb in ['RF', 'LF']:
+                # If feet are cut, only the cut foot may move (replant gate).
+                if cut_feet and FOOT_CUT_ENABLED and limb not in cut_feet:
+                    continue
+
                 current = state['limbs'].get(limb, None)
                 current_id = current['hole_id'] if current else -1
-                
+
                 for next_hold in self.foot_holds:
                     next_id = next_hold['hole_id']
                     if current_id != next_id and self.is_valid_foot_transition(
@@ -520,10 +591,16 @@ class ClimbSequenceGenerator:
                         #new state
                         new_limbs = {k: v for k, v in state['limbs'].items()}
                         new_limbs[limb] = next_hold
-                        
-                        #lower scores for foot movements
+
+                        # Re-plant clears this foot from cut_feet.
+                        new_cut = cut_feet - {limb} if cut_feet else cut_feet
+
+                        #lower scores for foot movements; small bonus when this
+                        #move is a replant restoring tension.
                         move_score = 0.5
-                        
+                        if cut_feet and limb in cut_feet:
+                            move_score += 2.0
+
                         new_states.append({
                             'sequence': state['sequence'] + [{
                                 'limb': limb,
@@ -531,28 +608,40 @@ class ClimbSequenceGenerator:
                                 'position': next_hold.get('position')
                             }],
                             'limbs': new_limbs,
+                            'cut_feet': new_cut,
                             'score': state['score'] + move_score
                         })
-        
+
         return new_states
 
     def _initialize_beam(self):
         #initilize with start positions
         beam = []
-        
+
+        def _start_seq(rh_hold, lh_hold):
+            # Emit the matched-start as the first two recorded moves so the
+            # rendered sequence begins on the start holds.
+            return [
+                {'limb': 'RH', 'hold': rh_hold['hole_id'],
+                 'position': rh_hold.get('position')},
+                {'limb': 'LH', 'hold': lh_hold['hole_id'],
+                 'position': lh_hold.get('position')},
+            ]
+
         #just hands on start holds
         for rh in self.start_holds:
             for lh in self.start_holds:
                 if rh != lh:  # Different holds for each hand
                     # Initial state with just hands positioned
                     beam.append({
-                        'sequence': [],
+                        'sequence': _start_seq(rh, lh),
                         'limbs': {
                             'RH': rh, 
                             'LH': lh,
                             'RF': None,
                             'LF': None
                         },
+                        'cut_feet': frozenset(),
                         'score': 0
                     })
         
@@ -560,13 +649,14 @@ class ClimbSequenceGenerator:
         if not beam and self.start_holds:
             for h in self.start_holds:
                 beam.append({
-                    'sequence': [],
+                    'sequence': _start_seq(h, h),
                     'limbs': {
                         'RH': h, 
                         'LH': h,
                         'RF': None,
                         'LF': None
                     },
+                    'cut_feet': frozenset(),
                     'score': 0
                 })
         
@@ -611,12 +701,21 @@ class ClimbSequenceGenerator:
         if not finish_ids:
             return False
 
-        # Single finish: at least one hand on it
+        # Finish condition by hand occupancy.
         if len(finish_ids) == 1:
-            return any(h in finish_ids for h in hand_ids)
+            finish_ok = any(h in finish_ids for h in hand_ids)
+        else:
+            finish_ok = finish_ids.issubset(hand_ids)
+        if not finish_ok:
+            return False
 
-        # Multiple finishes: require hands to cover all finish holds
-        return finish_ids.issubset(hand_ids)
+        # Kilter convention: every painted hand-role hold (start/hand/finish)
+        # must be touched by a hand at some point in the route.
+        required_hand_ids = {h['hole_id'] for h in self.hand_holds}
+        visited_hand_ids = {m['hold'] for m in state['sequence']
+                            if m['limb'] in ('RH', 'LH')}
+        visited_hand_ids |= hand_ids
+        return required_hand_ids.issubset(visited_hand_ids)
 
     def _setup_timing(self):
         self.timers = {}

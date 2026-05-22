@@ -77,32 +77,24 @@ def export_training(input_file, output_file, per_climb=5, beam_width=6):
             return _sequence_is_reachable(gen, seq)
 
         all_seqs = res.get('all_sequences', [])
-        # Separate sequences with/without foot moves so we target a balanced mix.
-        regular_seqs = [s for s in all_seqs
-                        if not any(m['limb'] in ('RF', 'LF') for m in s.get('sequence', []))]
+        # Prefer foot-rich sequences. A sequence is "foot-rich" if it contains
+        # at least one RF/LF move (which is the case for any sequence produced
+        # by a dynamic hand move under the foot-cut rule). Fall back to
+        # hand-only sequences only if not enough foot sequences are available.
         foot_seqs    = [s for s in all_seqs
                         if     any(m['limb'] in ('RF', 'LF') for m in s.get('sequence', []))]
+        regular_seqs = [s for s in all_seqs
+                        if not any(m['limb'] in ('RF', 'LF') for m in s.get('sequence', []))]
 
-        n_regular_target = max(1, (per_climb + 1) // 2)   # ceil(per_climb / 2)
-        n_foot_target    = per_climb // 2
-
-        n_regular_kept = n_foot_kept = 0
+        n_kept = 0
         seq_i = 0
-        for seqobj in regular_seqs + foot_seqs:
-            if n_regular_kept + n_foot_kept >= per_climb:
+        for seqobj in foot_seqs + regular_seqs:
+            if n_kept >= per_climb:
                 break
             seq = seqobj.get('sequence', [])
             if not _seq_is_valid(seq):
                 continue
-            has_foot = any(m['limb'] in ('RF', 'LF') for m in seq)
-            if has_foot:
-                if n_foot_kept >= n_foot_target:
-                    continue
-                n_foot_kept += 1
-            else:
-                if n_regular_kept >= n_regular_target:
-                    continue
-                n_regular_kept += 1
+            n_kept += 1
             results.append({
                 'id': f"{climb_id}_gen_{seq_i}",
                 'name': name,
