@@ -8,8 +8,16 @@ from typing import Dict, List, Optional, Tuple
 import matplotlib.pyplot as plt
 from matplotlib.widgets import Button
 
-from config import FOOT_CUT_ENABLED, MAX_FOOT_REACH, MAX_HAND_REACH, X_SPACING
-from kinematics import choose_cut_foot, is_dynamic_hand_move
+from config import FLAG_ENABLED, FOOT_CUT_ENABLED, MAX_FOOT_REACH, MAX_HAND_REACH, X_SPACING
+from kinematics import (
+    Body,
+    choose_cut_foot,
+    choose_flag_foot,
+    compute_flag_position,
+    estimate_hip as _kin_estimate_hip,
+    is_crossing_hand_move,
+    is_dynamic_hand_move,
+)
 
 ROLE_LABELS = {
     12: "Start",
@@ -217,24 +225,30 @@ def _get_hold_label(hold: Dict) -> str:
     return str(hole_id) if hole_id is not None else ""
 
 
-def _draw_hold_scatter(holds: List[Dict], annotate: bool = False, ax=None) -> None:
+def _draw_hold_scatter(holds: List[Dict], annotate: bool = False, ax=None,
+                       show_direction: bool = True) -> None:
     """Draw role-colored hold rings on top of the board image (pixel space).
 
     Each hold uses its detected pixel center and radius (from the calibration
     lookup) when available, falling back to the affine projection otherwise.
+    When `show_direction` is True and a hold has known orientation, a small
+    line is drawn through the hold center aligned with its edge-tangent.
     """
     if ax is None:
         ax = plt.gca()
 
     fig = ax.figure
     dpi = fig.dpi if fig is not None else 72.0
-    # Ring diameter sized to roughly cover the hold footprint (one grid cell
-    # is 4 board units). Detected radii come from screw-dot detection and are
-    # too small to use directly.
     base_diameter_px = HOLD_MARKER_SCALE * 4.0 * BOARD_PX_PER_UNIT_X
-    # Foot/screw-on holds are physically smaller and sit at half-row offsets
-    # between main holds; shrink their ring so it highlights only the foot.
     role_diameter_scale = {15: 0.32}
+
+    orientations = {}
+    if show_direction:
+        try:
+            from sequence_generator import load_hold_orientations
+            orientations = load_hold_orientations()
+        except Exception:
+            orientations = {}
 
     for hold in holds:
         px, py, _r = _hold_to_px(hold)
@@ -252,6 +266,18 @@ def _draw_hold_scatter(holds: List[Dict], annotate: bool = False, ax=None) -> No
             linewidths=2.5,
             zorder=4,
         )
+
+        if show_direction and role_id in (12, 13, 14):
+            entry = orientations.get(hold.get('hole_id'))
+            if entry and float(entry.get('confidence', 0.0)) >= 0.4:
+                deg = float(entry.get('direction_deg', 0.0))
+                # Edge tangent on image: pixel-y grows DOWNWARD so we negate.
+                theta = math.radians(deg)
+                r = diameter_px * 0.45
+                dx = r * math.cos(theta)
+                dy = -r * math.sin(theta)
+                ax.plot([px - dx, px + dx], [py - dy, py + dy],
+                        color=color, lw=1.4, alpha=0.85, zorder=5)
 
         if annotate:
             label = _get_hold_label(hold)
@@ -319,16 +345,20 @@ def classify_dynamic_moves(holds: List[Dict], sequence: List[Dict]) -> List[Dict
       - 'is_dynamic': bool — the hand move cut a foot
       - 'cut_limb': 'LF'|'RF'|None — which foot was cut by this move
       - 'is_replant': bool — this foot move re-plants a previously cut foot
+      - 'flag_limb': 'LF'|'RF'|None — which foot was put into a flag by this move
+      - 'is_unflag': bool — this foot move replants from a flag
     """
     hold_map = _build_hold_map(holds)
     limb_positions = {'RH': None, 'LH': None, 'RF': None, 'LF': None}
     cut_feet = set()
+    flags = {'RF': None, 'LF': None}
     tags = []
 
     for move in sequence:
         limb = move.get('limb')
         hold = hold_map.get(move.get('hold'))
-        tag = {'is_dynamic': False, 'cut_limb': None, 'is_replant': False}
+        tag = {'is_dynamic': False, 'cut_limb': None, 'is_replant': False,
+               'flag_limb': None, 'is_unflag': False}
         if hold is None or limb not in limb_positions:
             tags.append(tag)
             continue
@@ -340,6 +370,7 @@ def classify_dynamic_moves(holds: List[Dict], sequence: List[Dict]) -> List[Dict
                         if limb_positions[f] is not None]
             other_hand = 'LH' if limb == 'RH' else 'RH'
             other_hand_xy = limb_positions[other_hand]
+            cut_happened = False
             if is_dynamic_hand_move(prev_hand_xy, new_xy, foot_xys, limb, other_hand_xy):
                 foot_dict = {f: limb_positions[f] for f in ('RF', 'LF')}
                 cut = choose_cut_foot(limb, foot_dict)
@@ -348,14 +379,179 @@ def classify_dynamic_moves(holds: List[Dict], sequence: List[Dict]) -> List[Dict
                     tag['cut_limb'] = cut
                     cut_feet.add(cut)
                     limb_positions[cut] = None
+                    flags[cut] = None
+                    cut_happened = True
+            if FLAG_ENABLED and not cut_happened:
+                if is_crossing_hand_move(new_xy, other_hand_xy, limb):
+                    foot_dict = {f: limb_positions[f] for f in ('RF', 'LF')}
+                    flag_foot = choose_flag_foot(limb, foot_dict)
+                    if flag_foot is not None:
+                        planted = [v for v in foot_dict.values() if v is not None]
+                        hip = _kin_estimate_hip(planted)
+                        if hip is not None:
+                            flags[flag_foot] = compute_flag_position(hip, new_xy, flag_foot)
+                            limb_positions[flag_foot] = None
+                            tag['flag_limb'] = flag_foot
         elif FOOT_CUT_ENABLED and limb in cut_feet:
             tag['is_replant'] = True
             cut_feet.discard(limb)
+            flags[limb] = None
+        elif limb in ('RF', 'LF') and flags.get(limb) is not None:
+            tag['is_unflag'] = True
+            flags[limb] = None
 
         limb_positions[limb] = new_xy
         tags.append(tag)
 
     return tags
+
+
+def compute_bodies_along_sequence(
+    holds: List[Dict], sequence: List[Dict]
+) -> List[Body]:
+    """Build a Body snapshot at every move (after applying that move).
+
+    Mirrors classify_dynamic_moves' state tracking so cut feet are excluded
+    from hip estimation at the moves where they apply. Also tracks phantom
+    flags (off-hold balancing feet) so the body renders the dashed leg.
+    """
+    hold_map = _build_hold_map(holds)
+    limb_positions = {'RH': None, 'LH': None, 'RF': None, 'LF': None}
+    cut_feet = set()
+    flags = {'RF': None, 'LF': None}
+    bodies: List[Body] = []
+
+    for move in sequence:
+        limb = move.get('limb')
+        hold = hold_map.get(move.get('hold'))
+        if hold is None or limb not in limb_positions:
+            bodies.append(Body.from_limb_positions(limb_positions,
+                                                   cut_feet=cut_feet,
+                                                   flags=flags))
+            continue
+        new_xy = (hold.get('x', 0), hold.get('y', 0))
+
+        if FOOT_CUT_ENABLED and limb in ('RH', 'LH'):
+            prev_hand_xy = limb_positions[limb]
+            foot_xys = [limb_positions[f] for f in ('RF', 'LF')
+                        if limb_positions[f] is not None]
+            other_hand = 'LH' if limb == 'RH' else 'RH'
+            other_hand_xy = limb_positions[other_hand]
+            cut_happened = False
+            if is_dynamic_hand_move(prev_hand_xy, new_xy, foot_xys, limb, other_hand_xy):
+                foot_dict = {f: limb_positions[f] for f in ('RF', 'LF')}
+                cut = choose_cut_foot(limb, foot_dict)
+                if cut is not None:
+                    cut_feet.add(cut)
+                    limb_positions[cut] = None
+                    flags[cut] = None
+                    cut_happened = True
+            if FLAG_ENABLED and not cut_happened:
+                if is_crossing_hand_move(new_xy, other_hand_xy, limb):
+                    foot_dict = {f: limb_positions[f] for f in ('RF', 'LF')}
+                    flag_foot = choose_flag_foot(limb, foot_dict)
+                    if flag_foot is not None:
+                        planted = [v for v in foot_dict.values() if v is not None]
+                        hip = _kin_estimate_hip(planted)
+                        if hip is not None:
+                            flags[flag_foot] = compute_flag_position(hip, new_xy, flag_foot)
+                            limb_positions[flag_foot] = None
+        elif FOOT_CUT_ENABLED and limb in cut_feet:
+            cut_feet.discard(limb)
+            flags[limb] = None
+        elif limb in ('RF', 'LF') and flags.get(limb) is not None:
+            flags[limb] = None
+
+        limb_positions[limb] = new_xy
+        bodies.append(Body.from_limb_positions(limb_positions,
+                                               cut_feet=cut_feet,
+                                               flags=flags))
+
+    return bodies
+
+
+def _body_xy_to_px(xy):
+    """Board (x,y) of a body joint -> pixel (px,py).
+
+    Body joints are not real holds; reuse the same y+8 / set_id=1 affine the
+    non-kickboard hold path uses so joints align with their parent hand/foot
+    markers. Returns None when input is None for plotting convenience.
+    """
+    if xy is None:
+        return None
+    return _board_to_px(xy[0], xy[1] + 8, set_id=1)
+
+
+def _draw_body(ax, body: Body, alpha: float = 1.0, zorder: int = 9):
+    """Render an articulated body on the axes. Returns the list of artists
+    so they can be removed before the next frame in the cycle viewer.
+    """
+    artists = []
+    if body.hip is None or body.shoulder is None:
+        return artists
+
+    spine_color = '#444444'
+    joint_color = '#000000'
+
+    # Spine: hip -> shoulder -> head.
+    spine_pts = [body.hip, body.shoulder]
+    if body.head is not None:
+        spine_pts.append(body.head)
+    spine_px = [_body_xy_to_px(p) for p in spine_pts]
+    xs = [p[0] for p in spine_px]
+    ys = [p[1] for p in spine_px]
+    artists.append(ax.plot(xs, ys, '-', color=spine_color, lw=2.5,
+                           alpha=alpha, zorder=zorder)[0])
+
+    # Head circle.
+    if body.head is not None:
+        hx, hy = _body_xy_to_px(body.head)
+        head_size = X_SPACING * 0.55 * BOARD_PX_PER_UNIT_X
+        artists.append(ax.scatter([hx], [hy], s=head_size * 8,
+                                  facecolor='white', edgecolor=spine_color,
+                                  linewidth=2.0, alpha=alpha, zorder=zorder + 1))
+
+    # Arms: shoulder -> elbow -> hand.
+    for shoulder, elbow, hand, color in [
+        (body.r_shoulder, body.r_elbow, body.rh, LIMB_COLORS['RH']),
+        (body.l_shoulder, body.l_elbow, body.lh, LIMB_COLORS['LH']),
+    ]:
+        if shoulder is None or elbow is None or hand is None:
+            continue
+        pts = [_body_xy_to_px(p) for p in (shoulder, elbow, hand)]
+        artists.append(ax.plot([p[0] for p in pts], [p[1] for p in pts],
+                               '-', color=color, lw=3.0,
+                               alpha=alpha * 0.85, zorder=zorder)[0])
+        ex, ey = pts[1]
+        artists.append(ax.scatter([ex], [ey], s=40, facecolor=joint_color,
+                                  edgecolor='white', linewidth=0.5,
+                                  alpha=alpha, zorder=zorder + 1))
+
+    # Legs: hip -> knee -> foot (or flag).
+    for hip_pt, knee, foot, flag, color in [
+        (body.r_hip, body.r_knee, body.rf, body.rf_flag, LIMB_COLORS['RF']),
+        (body.l_hip, body.l_knee, body.lf, body.lf_flag, LIMB_COLORS['LF']),
+    ]:
+        target = foot if foot is not None else flag
+        if hip_pt is None or knee is None or target is None:
+            continue
+        pts = [_body_xy_to_px(p) for p in (hip_pt, knee, target)]
+        line_style = '--' if (foot is None and flag is not None) else '-'
+        artists.append(ax.plot([p[0] for p in pts], [p[1] for p in pts],
+                               line_style, color=color, lw=3.0,
+                               alpha=alpha * 0.85, zorder=zorder)[0])
+        kx, ky = pts[1]
+        artists.append(ax.scatter([kx], [ky], s=40, facecolor=joint_color,
+                                  edgecolor='white', linewidth=0.5,
+                                  alpha=alpha, zorder=zorder + 1))
+        # Open square at flag endpoint to distinguish from planted foot.
+        if foot is None and flag is not None:
+            fx, fy = pts[2]
+            artists.append(ax.scatter([fx], [fy], s=120, marker='s',
+                                      facecolor='none', edgecolor=color,
+                                      linewidth=2.0, alpha=alpha,
+                                      zorder=zorder + 1))
+    return artists
 
 
 def plot_climb_sequence(
@@ -366,6 +562,7 @@ def plot_climb_sequence(
     show: bool = False,
     annotate_holds: bool = False,
     include_stats: bool = True,
+    draw_body: bool = True,
 ) -> None:
     if not holds or not sequence:
         raise ValueError("Climb has no holds or sequence")
@@ -410,6 +607,14 @@ def plot_climb_sequence(
                    linewidth=1.2, zorder=10)
         ax.text(x, y, str(i + 1), fontsize=9, ha="center", va="center",
                 color="black", zorder=11, fontweight="bold")
+
+    if draw_body:
+        bodies = compute_bodies_along_sequence(holds, sequence)
+        if bodies:
+            # First pose faded (starting posture).
+            _draw_body(ax, bodies[0], alpha=0.30, zorder=8)
+            # Last pose solid (finishing posture).
+            _draw_body(ax, bodies[-1], alpha=0.95, zorder=9)
 
     ax.legend(handles=_role_legend_handles(), loc="upper right",
               framealpha=0.85, fontsize=9)
@@ -466,6 +671,7 @@ def plot_sequence_cycle(
     output_path: Optional[str] = None,
     show: bool = True,
     annotate_holds: bool = False,
+    draw_body: bool = True,
 ):
     """Interactive step-through viewer overlaid on the Kilter board image."""
     if not holds or not sequence:
@@ -473,6 +679,7 @@ def plot_sequence_cycle(
 
     points_px = _sequence_points_px(holds, sequence)
     dyn_tags = classify_dynamic_moves(holds, sequence)
+    bodies = compute_bodies_along_sequence(holds, sequence) if draw_body else []
 
     _, img_w, img_h = _load_board_image()
     fig_w = 10.0
@@ -521,6 +728,15 @@ def plot_sequence_cycle(
               framealpha=0.85, fontsize=9)
 
     idx = {'i': 0}
+    body_artists: List = []
+
+    def _clear_body():
+        for art in body_artists:
+            try:
+                art.remove()
+            except Exception:
+                pass
+        body_artists.clear()
 
     def update():
         i = idx['i']
@@ -537,6 +753,9 @@ def plot_sequence_cycle(
             suffix = "  [replant]"
         ax.set_title(f"{title} — Move {i+1}/{len(points_px)} — {limb}{suffix}")
         info_text.set_text(f"Active limb: {limb}\nHold: {sequence[i].get('hold')}{suffix}")
+        if draw_body and i < len(bodies):
+            _clear_body()
+            body_artists.extend(_draw_body(ax, bodies[i], alpha=1.0))
         fig.canvas.draw_idle()
 
     def prev(event):
@@ -670,7 +889,7 @@ def plot_hold_density(
     plt.close()
 
 
-def visualizeclimb(climb_data, climb_id, output_dir="climb_visualizations", viz_type="path"):
+def visualizeclimb(climb_data, climb_id, output_dir="climb_visualizations", viz_type="path", draw_body=True):
     os.makedirs(output_dir, exist_ok=True)
 
     climb = None
@@ -700,6 +919,7 @@ def visualizeclimb(climb_data, climb_id, output_dir="climb_visualizations", viz_
                 sequence,
                 title=f"{climb.get('name', 'Climb')} (ID: {climb_id})",
                 output_path=save_path,
+                draw_body=draw_body,
             )
         elif viz_type == "cycle":
             # interactive cycle view (shows a GUI window)
@@ -709,6 +929,7 @@ def visualizeclimb(climb_data, climb_id, output_dir="climb_visualizations", viz_
                 title=f"{climb.get('name', 'Climb')} (ID: {climb_id})",
                 output_path=None,
                 show=True,
+                draw_body=draw_body,
             )
         elif viz_type == "reachability-hand":
             plot_reachability_map(
@@ -752,7 +973,15 @@ def main():
         choices=["path", "cycle", "reachability-hand", "reachability-foot", "hold-density"],
         help="Type of visualization to generate",
     )
-    
+    parser.add_argument(
+        "--body", dest="draw_body", action="store_true", default=True,
+        help="Overlay articulated body skeleton (default).",
+    )
+    parser.add_argument(
+        "--no-body", dest="draw_body", action="store_false",
+        help="Disable the body overlay.",
+    )
+
     args = parser.parse_args()
     
     try:
@@ -763,7 +992,7 @@ def main():
         return
     
     #save
-    visualizeclimb(data, args.id, args.output_dir, args.type)
+    visualizeclimb(data, args.id, args.output_dir, args.type, draw_body=args.draw_body)
 
 if __name__ == "__main__":
     main()

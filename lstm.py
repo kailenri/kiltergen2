@@ -19,6 +19,7 @@ from config import (
     X_SPACING,
     FOOT_CUT_ENABLED,
     FOOT_REPLANT_MAX_STEPS,
+    FLAG_ENABLED,
 )
 from kinematics import (
     estimate_hip as _kin_estimate_hip,
@@ -28,6 +29,9 @@ from kinematics import (
     point_in_poly as _kin_point_in_poly,
     is_dynamic_hand_move,
     choose_cut_foot,
+    is_crossing_hand_move,
+    compute_flag_position,
+    choose_flag_foot,
 )
 
 # ---------------------------------------------------------------------------
@@ -161,13 +165,21 @@ class ClimbDataset(Dataset):
         print(f"Loaded spatial info for {len(self.hold_info)} holds")
 
     def build_spatial_features(self):
-        """Build a (vocab_size, 10) float tensor of per-token spatial features:
+        """Build a (vocab_size, 13) float tensor of per-token spatial features:
           [x_norm, y_norm, role_start, role_hand, role_finish, role_foot,
+           quality, dir_x, dir_y,
            limb_RH, limb_LH, limb_RF, limb_LF]
-        Token 0 (PAD) is all zeros.  Returns None if hold_info is empty.
+        Token 0 (PAD) is all zeros. Returns None if hold_info is empty.
+
+        The new (quality, dir_x, dir_y) triple is CV-derived from
+        `data/hold_orientations.json` via `get_hold_quality` /
+        `get_hold_direction`. Missing entries get a neutral fallback
+        (quality=0.7, dir_x=dir_y=0).
         """
         if not self.hold_info:
             return None
+
+        from sequence_generator import get_hold_direction, get_hold_quality
 
         x_vals = [info['x'] for info in self.hold_info.values()]
         y_vals = [info['y'] for info in self.hold_info.values()]
@@ -180,7 +192,7 @@ class ClimbDataset(Dataset):
         limb_order = [0, 1, 2, 3]       # RH, LH, RF, LF
         n_limbs = len(self.limb_mapping)
 
-        features = torch.zeros(self.vocab_size, 10)
+        features = torch.zeros(self.vocab_size, 13)
 
         for hold_id, hold_token in self.hold_mapping.items():
             if hold_id == 'PAD':
@@ -190,11 +202,23 @@ class ClimbDataset(Dataset):
             y_norm = (info.get('y', y_min) - y_min) / y_range
             role_id = info.get('role_id', 13)
             role_oh = [float(role_id == r) for r in role_order]
+            quality = get_hold_quality(hold_id)
+            dir_deg = get_hold_direction(hold_id)
+            if dir_deg is None:
+                dir_x, dir_y = 0.0, 0.0
+            else:
+                import math
+                rad = math.radians(dir_deg)
+                dir_x, dir_y = math.cos(rad), math.sin(rad)
             for limb_token in limb_order:
                 token_id = (hold_token * n_limbs) + limb_token + 1
                 if 0 < token_id < self.vocab_size:
                     limb_oh = [float(limb_token == lt) for lt in limb_order]
-                    features[token_id] = torch.tensor([x_norm, y_norm] + role_oh + limb_oh)
+                    features[token_id] = torch.tensor(
+                        [x_norm, y_norm] + role_oh +
+                        [quality, dir_x, dir_y] +
+                        limb_oh
+                    )
 
         print(f"Built spatial feature tensor: {features.shape}")
         return features
@@ -426,11 +450,12 @@ class ClimbLSTM(nn.Module):
         # learned limb identity embedding, replacing the flat per-token
         # spatial_proj with a more expressive, parameter-efficient module.
         #
-        # hold_features buffer: (vocab_size, 6) = first 6 dims of spatial_features
-        #   [x_norm, y_norm, role_start, role_hand, role_finish, role_foot]
+        # hold_features buffer: (vocab_size, 9) = first 9 dims of spatial_features
+        #   [x_norm, y_norm, role_start, role_hand, role_finish, role_foot,
+        #    quality, dir_x, dir_y]
         # Limb identity is captured by HoldEncoder's own Embedding rather than
-        # the last 4 one-hot columns of the original 10-dim feature.
-        _HOLD_FEAT_DIM  = 6
+        # the last 4 one-hot columns of the original feature.
+        _HOLD_FEAT_DIM  = 9
         _HOLD_EMBED_DIM = 32
         _LIMB_EMBED_DIM = 8
         lstm_input_dim = embedding_dim
@@ -1060,6 +1085,7 @@ class ClimbGenerator:
             limb_positions = {'RH': None, 'LH': None, 'RF': None, 'LF': None}
             used_hold_ids = set()
             cut_feet = set()
+            flags = {'RF': None, 'LF': None}
             for hold_id, limb in start_holds:
                 if hold_id in self.dataset.hold_mapping:
                     hold_token = self.dataset.hold_mapping[hold_id]
@@ -1188,7 +1214,8 @@ class ClimbGenerator:
 
                             # Foot-cut / replant bookkeeping mirroring the beam
                             # generator: a dynamic hand move may cut a foot,
-                            # and the next foot move re-plants it.
+                            # and the next foot move re-plants it. A non-dynamic
+                            # cross triggers a phantom flag on the opposite foot.
                             if FOOT_CUT_ENABLED:
                                 if mv_limb in ('RH', 'LH'):
                                     prev_hand_xy = limb_positions[mv_limb]
@@ -1196,6 +1223,7 @@ class ClimbGenerator:
                                                 if limb_positions[f] is not None]
                                     other_hand = 'LH' if mv_limb == 'RH' else 'RH'
                                     other_hand_xy = limb_positions[other_hand]
+                                    cut_happened = False
                                     if is_dynamic_hand_move(prev_hand_xy, new_xy, foot_xys,
                                                             mv_limb, other_hand_xy):
                                         foot_dict = {f: limb_positions[f] for f in ('RF', 'LF')}
@@ -1203,8 +1231,25 @@ class ClimbGenerator:
                                         if cut is not None:
                                             cut_feet.add(cut)
                                             limb_positions[cut] = None
+                                            flags[cut] = None
+                                            cut_happened = True
+                                    if FLAG_ENABLED and not cut_happened:
+                                        if is_crossing_hand_move(new_xy, other_hand_xy, mv_limb):
+                                            foot_dict = {f: limb_positions[f] for f in ('RF', 'LF')}
+                                            flag_foot = choose_flag_foot(mv_limb, foot_dict)
+                                            if flag_foot is not None:
+                                                planted = [v for v in foot_dict.values() if v is not None]
+                                                hip = _kin_estimate_hip(planted)
+                                                if hip is not None:
+                                                    flags[flag_foot] = compute_flag_position(
+                                                        hip, new_xy, flag_foot,
+                                                    )
+                                                    limb_positions[flag_foot] = None
                                 elif mv_limb in cut_feet:
                                     cut_feet.discard(mv_limb)
+                                    flags[mv_limb] = None
+                                elif mv_limb in ('RF', 'LF') and flags.get(mv_limb) is not None:
+                                    flags[mv_limb] = None
 
                             limb_positions[mv_limb] = new_xy
                             used_hold_ids.add(move.get('hold'))

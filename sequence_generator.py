@@ -1,8 +1,10 @@
 import numpy as np
 import heapq
 import math
+import json
+import os
 from collections import defaultdict
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Optional
 from functools import lru_cache
 from concurrent.futures import ThreadPoolExecutor
 from itertools import chain
@@ -17,7 +19,61 @@ from kinematics import (
     point_in_poly as _kin_point_in_poly,
     is_dynamic_hand_move,
     choose_cut_foot,
+    is_crossing_hand_move,
+    compute_flag_position,
+    choose_flag_foot,
 )
+
+
+# ---------------------------------------------------------------------------
+# Hold orientation + quality (from scripts/build_hold_orientations.py output)
+# ---------------------------------------------------------------------------
+
+_ORIENTATIONS_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    'data', 'hold_orientations.json',
+)
+_ORIENTATIONS_CACHE: Optional[Dict[int, Dict]] = None
+
+
+def load_hold_orientations() -> Dict[int, Dict]:
+    """Lazy-load per-hold orientation metadata. Empty dict if file missing."""
+    global _ORIENTATIONS_CACHE
+    if _ORIENTATIONS_CACHE is not None:
+        return _ORIENTATIONS_CACHE
+    _ORIENTATIONS_CACHE = {}
+    if not os.path.exists(_ORIENTATIONS_PATH):
+        return _ORIENTATIONS_CACHE
+    try:
+        with open(_ORIENTATIONS_PATH) as f:
+            payload = json.load(f)
+        for hid_str, entry in payload.get('holds', {}).items():
+            try:
+                _ORIENTATIONS_CACHE[int(hid_str)] = entry
+            except (TypeError, ValueError):
+                continue
+    except Exception:
+        pass
+    return _ORIENTATIONS_CACHE
+
+
+def get_hold_quality(hole_id: int) -> float:
+    """Quality in [0.5, 1.0]; neutral 0.7 fallback for unmapped holds."""
+    entry = load_hold_orientations().get(hole_id)
+    if entry is None:
+        return 0.7
+    return float(entry.get('quality', 0.7))
+
+
+def get_hold_direction(hole_id: int, min_confidence: float = 0.4
+                       ) -> Optional[float]:
+    """Returns direction_deg (edge-tangent) or None if confidence too low."""
+    entry = load_hold_orientations().get(hole_id)
+    if entry is None:
+        return None
+    if float(entry.get('confidence', 0.0)) < min_confidence:
+        return None
+    return float(entry.get('direction_deg', 0.0))
 
 class ClimbSequenceGenerator:
     def __init__(self, holds_data: List[Dict], num_workers: int = 4):
@@ -250,6 +306,7 @@ class ClimbSequenceGenerator:
 
         metrics = {
             'hold_quality': 0.0,
+            'hold_alignment': 0.0,
             'movement_efficiency': 0.0,
             'limb_alternation': 0.0,
             'body_position': 0.0,
@@ -259,6 +316,7 @@ class ClimbSequenceGenerator:
             'completion': 0.0,
             'coverage': 0.0,
             'foot_tension_recovery': 0.0,
+            'flag_quality': 0.0,
         }
 
         limb_use = defaultdict(int)
@@ -269,6 +327,8 @@ class ClimbSequenceGenerator:
         # rewards re-planting and penalizes proceeding with hands while cut.
         cut_feet = set()
         steps_since_cut = {}  # foot -> moves elapsed since cut
+        # Parallel: flag state (off-hold but valid stance).
+        flags = {'RF': None, 'LF': None}
 
         for i, move in enumerate(sequence):
             hold = self.hold_dict.get(move['hold'])
@@ -288,6 +348,7 @@ class ClimbSequenceGenerator:
                     if cut_feet:
                         # Climber proceeded with a hand while a foot was cut.
                         metrics['foot_tension_recovery'] -= 3.0
+                    cut_happened = False
                     if is_dynamic_hand_move(prev_hand_xy, new_hand_xy, foot_xys,
                                             limb, other_hand_xy):
                         foot_dict = {f: limb_positions[f] for f in ('RF', 'LF')}
@@ -296,25 +357,81 @@ class ClimbSequenceGenerator:
                             cut_feet.add(cut)
                             steps_since_cut[cut] = 0
                             limb_positions[cut] = None
+                            flags[cut] = None
+                            cut_happened = True
+                    # Phantom-flag trigger (only when not cutting).
+                    if FLAG_ENABLED and not cut_happened:
+                        if is_crossing_hand_move(new_hand_xy, other_hand_xy, limb):
+                            foot_dict = {f: limb_positions[f] for f in ('RF', 'LF')}
+                            flag_foot = choose_flag_foot(limb, foot_dict)
+                            if flag_foot is not None:
+                                planted = [v for v in foot_dict.values() if v is not None]
+                                hip = _kin_estimate_hip(planted)
+                                if hip is not None:
+                                    flag_xy = compute_flag_position(hip, new_hand_xy, flag_foot)
+                                    flags[flag_foot] = flag_xy
+                                    limb_positions[flag_foot] = None
+                                    # Reward: flag on opposite side of moving hand.
+                                    side_hand = 1 if new_hand_xy[0] >= hip[0] else -1
+                                    side_flag = 1 if flag_xy[0] >= hip[0] else -1
+                                    if side_hand != side_flag:
+                                        metrics['flag_quality'] += 1.0
+                                    else:
+                                        metrics['flag_quality'] += 0.3
                 elif limb in ('RF', 'LF') and limb in cut_feet:
                     elapsed = steps_since_cut.get(limb, 0)
                     if elapsed <= FOOT_REPLANT_MAX_STEPS:
                         metrics['foot_tension_recovery'] += 2.0
                     cut_feet.discard(limb)
                     steps_since_cut.pop(limb, None)
+                    flags[limb] = None
+                elif limb in ('RF', 'LF') and flags.get(limb) is not None:
+                    # Re-plant from a flag.
+                    flags[limb] = None
+                    metrics['flag_quality'] += 0.5
                 # Age remaining cuts.
                 for f in list(steps_since_cut.keys()):
                     steps_since_cut[f] += 1
 
             limb_positions[limb] = (hold['x'], hold['y'])
 
-            # hold quality
+            # hold quality (CV-derived from board image; neutral 0.7 fallback).
+            q = get_hold_quality(hold['hole_id'])
             if hold['role_id'] == 14:
                 metrics['hold_quality'] += 10
             elif hold['role_id'] == 12:
                 metrics['hold_quality'] += 5
+            elif limb in ('RH', 'LH'):
+                metrics['hold_quality'] += q
             else:
-                metrics['hold_quality'] += 1
+                metrics['hold_quality'] += 0.5 * q
+
+            # Hand-pull alignment: compare pull-vector (hand - shoulder) to
+            # the hold's edge-tangent direction. Cosine in [-1, 1]; we keep
+            # positive contributions and clip negatives to penalize pulling
+            # against a hold's natural direction.
+            if limb in ('RH', 'LH'):
+                hold_dir = get_hold_direction(hold['hole_id'])
+                feet_xys = [limb_positions[f] for f in ('RF', 'LF')
+                            if limb_positions[f] is not None]
+                if hold_dir is not None and feet_xys:
+                    hip = _kin_estimate_hip(feet_xys)
+                    shoulder = _kin_estimate_shoulder(hip) if hip else None
+                    if shoulder is not None:
+                        pdx = hold['x'] - shoulder[0]
+                        pdy = hold['y'] - shoulder[1]
+                        pmag = math.hypot(pdx, pdy)
+                        if pmag > 1e-6:
+                            pull_deg = math.degrees(math.atan2(pdy, pdx))
+                            # Edge tangent is axis-symmetric (±180 equivalent);
+                            # take absolute cosine of the doubled-angle diff,
+                            # then map back via cos(diff)^2 → align ∈ [-1, 1].
+                            diff = math.radians(pull_deg - hold_dir)
+                            align = math.cos(diff)
+                            # Push axis-symmetry: a sidepull aligned 180° away
+                            # is just as compatible as 0°.
+                            align = max(align, math.cos(diff + math.pi))
+                            metrics['hold_alignment'] += align
 
             # movement efficiency (shorter moves preferred)
             if i > 0:
@@ -389,22 +506,27 @@ class ClimbSequenceGenerator:
         hand_moves = sum(1 for m in sequence if m['limb'] in ('RH', 'LH'))
         if hand_moves > 1:
             metrics['limb_alternation'] /= max(1, (hand_moves - 1))
+        # Normalize alignment so length doesn't dominate; keep ~[-1, 1] range.
+        if hand_moves > 0:
+            metrics['hold_alignment'] /= hand_moves
 
         # keep cross_prevention non-negative (higher is better)
         metrics['cross_prevention'] = max(0.0, metrics['cross_prevention'] + 8.0)
 
         # assemble weights
         weights = {
-            'hold_quality': 0.10,
+            'hold_quality': 0.07,
+            'hold_alignment': 0.08,
             'movement_efficiency': 0.13,
             'limb_alternation': 0.12,
             'body_position': 0.10,
-            'cross_prevention': 0.10,
+            'cross_prevention': 0.07,
             'triangular_support': 0.10,
             'hand_support': 0.10,
             'completion': 0.10,
             'coverage': 0.10,
             'foot_tension_recovery': 0.05,
+            'flag_quality': 0.05,
         }
 
         total_score = 0.0
@@ -499,9 +621,11 @@ class ClimbSequenceGenerator:
             ))
 
             cut_feet = state.get('cut_feet', frozenset())
+            flags = state.get('flags', {'RF': None, 'LF': None})
             # While any foot is cut by a prior dynamic hand move, the climber
             # must re-plant it before any further hand reach. Mask out hand
-            # expansions entirely until cut_feet is empty.
+            # expansions entirely until cut_feet is empty. Flags do NOT block
+            # hand moves (a flag is a valid stance).
             hands_allowed = (not cut_feet) or (not FOOT_CUT_ENABLED)
 
             # Pre-compute hands already visited so we can reward first-time coverage.
@@ -543,8 +667,14 @@ class ClimbSequenceGenerator:
                             if next_id not in visited_hand_ids:
                                 move_score += 8
 
+                            # Quality bias: prefer high-quality (jug/crimp) holds.
+                            q = get_hold_quality(next_id)
+                            move_score *= (0.7 + 0.6 * q)  # q=0.5 -> 1.0x, q=1.0 -> 1.3x
+
                             # Detect dynamic move and cut a foot if so.
                             new_cut = cut_feet
+                            new_flags = dict(flags)
+                            cut_happened = False
                             if FOOT_CUT_ENABLED:
                                 prev_hand_xy = (current['x'], current['y']) if current else None
                                 new_hand_xy = (next_hold['x'], next_hold['y'])
@@ -563,6 +693,35 @@ class ClimbSequenceGenerator:
                                     if cut is not None:
                                         new_limbs[cut] = None
                                         new_cut = frozenset({cut})
+                                        new_flags[cut] = None  # cut clears any pre-existing flag
+                                        cut_happened = True
+
+                            # Phantom-flag trigger: if the move crosses the body line
+                            # (and we did NOT just cut), put the opposite foot into a
+                            # flag state. This is a soft stance — no penalty for
+                            # continuing with other hand moves later.
+                            if FLAG_ENABLED and not cut_happened:
+                                other_hand = 'LH' if limb == 'RH' else 'RH'
+                                other = state['limbs'].get(other_hand)
+                                other_hand_xy = (other['x'], other['y']) if other else None
+                                new_hand_xy = (next_hold['x'], next_hold['y'])
+                                if is_crossing_hand_move(new_hand_xy, other_hand_xy, limb):
+                                    foot_dict = {f: ((state['limbs'][f]['x'], state['limbs'][f]['y'])
+                                                     if state['limbs'].get(f) else None)
+                                                 for f in ('RF', 'LF')}
+                                    flag_foot = choose_flag_foot(limb, foot_dict)
+                                    if flag_foot is not None:
+                                        # Estimate hip from currently planted feet.
+                                        foot_xys = [v for v in foot_dict.values() if v is not None]
+                                        hip = _kin_estimate_hip(foot_xys)
+                                        if hip is not None:
+                                            new_flags[flag_foot] = compute_flag_position(
+                                                hip, new_hand_xy, flag_foot,
+                                            )
+                                            # Foot leaves the hold; cut_feet stays empty.
+                                            new_limbs[flag_foot] = None
+                                            # Small reward for a balanced flag.
+                                            move_score += 0.5
 
                             new_states.append({
                                 'sequence': state['sequence'] + [{
@@ -572,6 +731,7 @@ class ClimbSequenceGenerator:
                                 }],
                                 'limbs': new_limbs,
                                 'cut_feet': new_cut,
+                                'flags': new_flags,
                                 'score': state['score'] + move_score
                             })
 
@@ -592,14 +752,19 @@ class ClimbSequenceGenerator:
                         new_limbs = {k: v for k, v in state['limbs'].items()}
                         new_limbs[limb] = next_hold
 
-                        # Re-plant clears this foot from cut_feet.
+                        # Re-plant clears this foot from cut_feet AND any flag.
                         new_cut = cut_feet - {limb} if cut_feet else cut_feet
+                        new_flags = dict(flags)
+                        was_flagging = new_flags.get(limb) is not None
+                        new_flags[limb] = None
 
                         #lower scores for foot movements; small bonus when this
                         #move is a replant restoring tension.
                         move_score = 0.5
                         if cut_feet and limb in cut_feet:
                             move_score += 2.0
+                        if was_flagging:
+                            move_score += 1.0  # reward landing from a flag
 
                         new_states.append({
                             'sequence': state['sequence'] + [{
@@ -609,6 +774,7 @@ class ClimbSequenceGenerator:
                             }],
                             'limbs': new_limbs,
                             'cut_feet': new_cut,
+                            'flags': new_flags,
                             'score': state['score'] + move_score
                         })
 
@@ -642,6 +808,7 @@ class ClimbSequenceGenerator:
                             'LF': None
                         },
                         'cut_feet': frozenset(),
+                        'flags': {'RF': None, 'LF': None},
                         'score': 0
                     })
         
@@ -657,6 +824,7 @@ class ClimbSequenceGenerator:
                         'LF': None
                     },
                     'cut_feet': frozenset(),
+                    'flags': {'RF': None, 'LF': None},
                     'score': 0
                 })
         
