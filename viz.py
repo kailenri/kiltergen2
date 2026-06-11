@@ -8,6 +8,8 @@ from typing import Dict, List, Optional, Tuple
 import matplotlib.pyplot as plt
 from matplotlib.widgets import Button
 
+import dataclasses
+
 from config import FLAG_ENABLED, FOOT_CUT_ENABLED, MAX_FOOT_REACH, MAX_HAND_REACH, X_SPACING
 from kinematics import (
     Body,
@@ -17,7 +19,23 @@ from kinematics import (
     estimate_hip as _kin_estimate_hip,
     is_crossing_hand_move,
     is_dynamic_hand_move,
+    solve_2bone_ik as _kin_solve_2bone_ik,
+    _arm_bend_dir as _kin_arm_bend_dir,
+    _leg_bend_dir as _kin_leg_bend_dir,
 )
+
+# Render-time body proportions. The shared kinematics constants in config.py
+# are scaled for the beam-search reachability/ellipse math and over-shoot real
+# human limb lengths when used to actually draw a figure. These constants
+# render a realistic adult climber (in board-grid units, ~1 unit ≈ 1 inch).
+RENDER_TORSO_LEN     = 1.3 * X_SPACING   # ~24 in (hip -> shoulder)
+RENDER_HEAD_OFFSET   = 0.55 * X_SPACING  # ~10 in (shoulder -> head center)
+RENDER_UPPER_ARM_LEN = 0.7 * X_SPACING   # ~13 in
+RENDER_FOREARM_LEN   = 0.65 * X_SPACING  # ~12 in
+RENDER_THIGH_LEN     = 1.0 * X_SPACING   # ~19 in
+RENDER_SHIN_LEN      = 0.95 * X_SPACING  # ~18 in
+RENDER_SHOULDER_HALF = 0.45 * X_SPACING  # ~8 in (half shoulder/hip width)
+RENDER_HEAD_RADIUS   = 0.25 * X_SPACING  # ~5 in (head radius in board units)
 
 ROLE_LABELS = {
     12: "Start",
@@ -338,6 +356,151 @@ def compute_sequence_stats(holds: List[Dict], sequence: List[Dict]) -> Dict[str,
     }
 
 
+# --- Human-readable beta side panel ----------------------------------------
+
+_ROLE_LABEL_SHORT = {12: "start", 13: "crimp", 14: "FINISH", 15: "foot"}
+_LIMB_LABEL_LONG = {"RH": "Right Hand", "LH": "Left Hand",
+                    "RF": "Right Foot", "LF": "Left Foot"}
+
+
+def _direction_phrase(dx: float, dy: float) -> str:
+    """Compact phrase describing a move vector. Board units ~ inches."""
+    if abs(dx) < 1.0 and abs(dy) < 1.0:
+        return "match"
+    parts = []
+    if dy >= 1.0:
+        parts.append(f"up {int(round(abs(dy)))}\"")
+    elif dy <= -1.0:
+        parts.append(f"down {int(round(abs(dy)))}\"")
+    if dx >= 1.0:
+        parts.append(f"right {int(round(abs(dx)))}\"")
+    elif dx <= -1.0:
+        parts.append(f"left {int(round(abs(dx)))}\"")
+    return " + ".join(parts) if parts else "match"
+
+
+def _format_beta_steps(
+    holds: List[Dict], sequence: List[Dict], dyn_tags: List[Dict]
+) -> List[str]:
+    """Produce one human-readable beta line per move."""
+    hold_map = _build_hold_map(holds)
+    limb_positions: Dict[str, Optional[Tuple[float, float]]] = {
+        "RH": None, "LH": None, "RF": None, "LF": None,
+    }
+    lines: List[str] = []
+    for i, move in enumerate(sequence):
+        limb = move.get("limb", "?")
+        limb_name = _LIMB_LABEL_LONG.get(limb, limb)
+        hold_id = move.get("hold")
+        hold = hold_map.get(hold_id) if hold_id is not None else None
+        role = _ROLE_LABEL_SHORT.get(hold.get("role_id"), "hold") if hold else "hold"
+        new_xy = (hold.get("x", 0), hold.get("y", 0)) if hold else None
+
+        prev_xy = limb_positions.get(limb)
+        if prev_xy is None or new_xy is None:
+            phrase = "place on " + role
+        else:
+            dx = new_xy[0] - prev_xy[0]
+            dy = new_xy[1] - prev_xy[1]
+            phrase = f"{_direction_phrase(dx, dy)} to {role}"
+
+        tag = dyn_tags[i] if i < len(dyn_tags) else {}
+        flags = []
+        if tag.get("is_dynamic"):
+            cut = tag.get("cut_limb")
+            flags.append(f"DYNO, cut {cut}" if cut else "DYNO")
+        if tag.get("is_replant"):
+            flags.append("replant")
+        if tag.get("flag_limb"):
+            flags.append(f"flag {tag['flag_limb']}")
+        if tag.get("is_unflag"):
+            flags.append("unflag")
+        suffix = f"  [{', '.join(flags)}]" if flags else ""
+
+        lines.append(f"{i+1:>2}. {limb_name:<11} {phrase}{suffix}")
+        if new_xy is not None:
+            limb_positions[limb] = new_xy
+    return lines
+
+
+def _build_stats_lines(holds: List[Dict], sequence: List[Dict],
+                       dyn_tags: List[Dict]) -> List[str]:
+    """Stats block shown below the beta list."""
+    start_count = sum(1 for h in holds if h.get("role_id") == 12)
+    finish_count = sum(1 for h in holds if h.get("role_id") == 14)
+    foot_count = sum(1 for h in holds if h.get("role_id") == 15)
+    n_dyn = sum(1 for t in dyn_tags if t.get("is_dynamic"))
+    n_replant = sum(1 for t in dyn_tags if t.get("is_replant"))
+    stats = compute_sequence_stats(holds, sequence)
+    lines = [
+        f"Moves: {len(sequence)}",
+        f"Holds:  {start_count} start / {finish_count} finish / {foot_count} foot",
+    ]
+    if stats:
+        lines.append(f"Avg move: {stats['avg_distance']:.0f}\"  "
+                     f"Max: {stats['max_distance']:.0f}\"")
+        lines.append(f"Height gain: {stats['height_gain']:.0f}\"")
+    if n_dyn or n_replant:
+        lines.append(f"Dynamic: {n_dyn}   Replants: {n_replant}")
+    return lines
+
+
+def _render_beta_panel(
+    panel, beta_lines: List[str], stats_lines: List[str],
+    active_idx: Optional[int] = None,
+) -> None:
+    """Draw the beta + stats text into the right-side panel axes.
+
+    `active_idx` highlights one step (used by the GIF). Pass None for the
+    static plot to show every step at equal weight.
+    """
+    panel.clear()
+    panel.axis("off")
+    panel.set_xlim(0, 1)
+    panel.set_ylim(0, 1)
+
+    panel.text(0.02, 0.985, "BETA", fontsize=12, fontweight="bold",
+               va="top", ha="left", color="#222222")
+
+    n = len(beta_lines)
+    avail = 0.94 - 0.16
+    line_h = min(0.045, avail / max(n, 1))
+    font_size = 9 if n <= 14 else (8 if n <= 20 else 7)
+
+    y = 0.94
+    for i, line in enumerate(beta_lines):
+        if active_idx is None:
+            color = "#222222"
+            weight = "normal"
+            marker = "  "
+        elif i == active_idx:
+            color = "#000000"
+            weight = "bold"
+            marker = "\u25B6 "
+        elif i < active_idx:
+            color = "#888888"
+            weight = "normal"
+            marker = "  "
+        else:
+            color = "#bbbbbb"
+            weight = "normal"
+            marker = "  "
+        panel.text(0.02, y, marker + line, fontsize=font_size,
+                   family="monospace", va="top", ha="left",
+                   color=color, fontweight=weight)
+        y -= line_h
+
+    if stats_lines:
+        y_stats_top = 0.13
+        panel.text(0.02, y_stats_top, "STATS", fontsize=10, fontweight="bold",
+                   va="top", ha="left", color="#222222")
+        ys = y_stats_top - 0.035
+        for line in stats_lines:
+            panel.text(0.02, ys, line, fontsize=8, family="monospace",
+                       va="top", ha="left", color="#444444")
+            ys -= 0.028
+
+
 def classify_dynamic_moves(holds: List[Dict], sequence: List[Dict]) -> List[Dict]:
     """For each move index, return a tag describing dynamic/replant status.
 
@@ -482,16 +645,74 @@ def _body_xy_to_px(xy):
     return _board_to_px(xy[0], xy[1] + 8, set_id=1)
 
 
+def _rescale_body_for_render(body: Body) -> Body:
+    """Rebuild shoulder/head/elbow/knee using realistic limb proportions.
+
+    Hip and the end-effector positions (rh/lh/rf/lf and their flags) are
+    preserved so the figure stays anchored to the active holds.
+    """
+    if body.hip is None:
+        return body
+    hip = body.hip
+    shoulder = (hip[0], hip[1] + RENDER_TORSO_LEN)
+    head = (shoulder[0], shoulder[1] + RENDER_HEAD_OFFSET)
+    half = RENDER_SHOULDER_HALF
+    r_shoulder = (shoulder[0] + half, shoulder[1])
+    l_shoulder = (shoulder[0] - half, shoulder[1])
+    r_hip = (hip[0] + half, hip[1])
+    l_hip = (hip[0] - half, hip[1])
+
+    r_elbow = None
+    l_elbow = None
+    if body.rh is not None:
+        r_elbow, _ = _kin_solve_2bone_ik(
+            r_shoulder, body.rh, RENDER_UPPER_ARM_LEN, RENDER_FOREARM_LEN,
+            bend_dir=_kin_arm_bend_dir('RH', r_shoulder, body.rh),
+        )
+    if body.lh is not None:
+        l_elbow, _ = _kin_solve_2bone_ik(
+            l_shoulder, body.lh, RENDER_UPPER_ARM_LEN, RENDER_FOREARM_LEN,
+            bend_dir=_kin_arm_bend_dir('LH', l_shoulder, body.lh),
+        )
+
+    rf_target = body.rf if body.rf is not None else body.rf_flag
+    lf_target = body.lf if body.lf is not None else body.lf_flag
+    r_knee = None
+    l_knee = None
+    if rf_target is not None:
+        r_knee, _ = _kin_solve_2bone_ik(
+            r_hip, rf_target, RENDER_THIGH_LEN, RENDER_SHIN_LEN,
+            bend_dir=_kin_leg_bend_dir('RF', r_hip, rf_target),
+        )
+    if lf_target is not None:
+        l_knee, _ = _kin_solve_2bone_ik(
+            l_hip, lf_target, RENDER_THIGH_LEN, RENDER_SHIN_LEN,
+            bend_dir=_kin_leg_bend_dir('LF', l_hip, lf_target),
+        )
+
+    return dataclasses.replace(
+        body,
+        shoulder=shoulder, head=head,
+        r_shoulder=r_shoulder, l_shoulder=l_shoulder,
+        r_hip=r_hip, l_hip=l_hip,
+        r_elbow=r_elbow, l_elbow=l_elbow,
+        r_knee=r_knee, l_knee=l_knee,
+    )
+
+
 def _draw_body(ax, body: Body, alpha: float = 1.0, zorder: int = 9):
     """Render an articulated body on the axes. Returns the list of artists
     so they can be removed before the next frame in the cycle viewer.
     """
     artists = []
-    if body.hip is None or body.shoulder is None:
+    if body.hip is None:
+        return artists
+    body = _rescale_body_for_render(body)
+    if body.shoulder is None:
         return artists
 
-    spine_color = '#444444'
-    joint_color = '#000000'
+    spine_color = '#222222'
+    joint_color = '#111111'
 
     # Spine: hip -> shoulder -> head.
     spine_pts = [body.hip, body.shoulder]
@@ -500,16 +721,22 @@ def _draw_body(ax, body: Body, alpha: float = 1.0, zorder: int = 9):
     spine_px = [_body_xy_to_px(p) for p in spine_pts]
     xs = [p[0] for p in spine_px]
     ys = [p[1] for p in spine_px]
-    artists.append(ax.plot(xs, ys, '-', color=spine_color, lw=2.5,
+    artists.append(ax.plot(xs, ys, '-', color=spine_color, lw=1.8,
                            alpha=alpha, zorder=zorder)[0])
 
-    # Head circle.
+    # Head: drawn as a filled circle sized in *data* (pixel) coords so it
+    # scales correctly with the figure regardless of DPI.
     if body.head is not None:
         hx, hy = _body_xy_to_px(body.head)
-        head_size = X_SPACING * 0.55 * BOARD_PX_PER_UNIT_X
-        artists.append(ax.scatter([hx], [hy], s=head_size * 8,
-                                  facecolor='white', edgecolor=spine_color,
-                                  linewidth=2.0, alpha=alpha, zorder=zorder + 1))
+        head_radius_px = RENDER_HEAD_RADIUS * BOARD_PX_PER_UNIT_X
+        from matplotlib.patches import Circle
+        head_circle = Circle(
+            (hx, hy), radius=head_radius_px,
+            facecolor='white', edgecolor=spine_color,
+            linewidth=1.4, alpha=alpha, zorder=zorder + 1,
+        )
+        ax.add_patch(head_circle)
+        artists.append(head_circle)
 
     # Arms: shoulder -> elbow -> hand.
     for shoulder, elbow, hand, color in [
@@ -520,11 +747,11 @@ def _draw_body(ax, body: Body, alpha: float = 1.0, zorder: int = 9):
             continue
         pts = [_body_xy_to_px(p) for p in (shoulder, elbow, hand)]
         artists.append(ax.plot([p[0] for p in pts], [p[1] for p in pts],
-                               '-', color=color, lw=3.0,
-                               alpha=alpha * 0.85, zorder=zorder)[0])
+                               '-', color=color, lw=2.0,
+                               alpha=alpha * 0.9, zorder=zorder)[0])
         ex, ey = pts[1]
-        artists.append(ax.scatter([ex], [ey], s=40, facecolor=joint_color,
-                                  edgecolor='white', linewidth=0.5,
+        artists.append(ax.scatter([ex], [ey], s=18, facecolor=joint_color,
+                                  edgecolor='white', linewidth=0.4,
                                   alpha=alpha, zorder=zorder + 1))
 
     # Legs: hip -> knee -> foot (or flag).
@@ -538,18 +765,18 @@ def _draw_body(ax, body: Body, alpha: float = 1.0, zorder: int = 9):
         pts = [_body_xy_to_px(p) for p in (hip_pt, knee, target)]
         line_style = '--' if (foot is None and flag is not None) else '-'
         artists.append(ax.plot([p[0] for p in pts], [p[1] for p in pts],
-                               line_style, color=color, lw=3.0,
-                               alpha=alpha * 0.85, zorder=zorder)[0])
+                               line_style, color=color, lw=2.0,
+                               alpha=alpha * 0.9, zorder=zorder)[0])
         kx, ky = pts[1]
-        artists.append(ax.scatter([kx], [ky], s=40, facecolor=joint_color,
-                                  edgecolor='white', linewidth=0.5,
+        artists.append(ax.scatter([kx], [ky], s=18, facecolor=joint_color,
+                                  edgecolor='white', linewidth=0.4,
                                   alpha=alpha, zorder=zorder + 1))
         # Open square at flag endpoint to distinguish from planted foot.
         if foot is None and flag is not None:
             fx, fy = pts[2]
-            artists.append(ax.scatter([fx], [fy], s=120, marker='s',
+            artists.append(ax.scatter([fx], [fy], s=60, marker='s',
                                       facecolor='none', edgecolor=color,
-                                      linewidth=2.0, alpha=alpha,
+                                      linewidth=1.4, alpha=alpha,
                                       zorder=zorder + 1))
     return artists
 
@@ -562,7 +789,7 @@ def plot_climb_sequence(
     show: bool = False,
     annotate_holds: bool = False,
     include_stats: bool = True,
-    draw_body: bool = True,
+    draw_body: bool = False,
 ) -> None:
     if not holds or not sequence:
         raise ValueError("Climb has no holds or sequence")
@@ -570,7 +797,13 @@ def plot_climb_sequence(
     _, img_w, img_h = _load_board_image()
     fig_w = 10.0
     fig_h = fig_w * (img_h / img_w)
-    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+    # Wider canvas to hold a right-side beta panel beside the board.
+    panel_frac = 0.48
+    total_w = fig_w * (1.0 + panel_frac)
+    fig = plt.figure(figsize=(total_w, fig_h))
+    gs = fig.add_gridspec(1, 2, width_ratios=[1.0, panel_frac], wspace=0.04)
+    ax = fig.add_subplot(gs[0, 0])
+    panel = fig.add_subplot(gs[0, 1])
     _setup_board_axes(ax)
 
     _draw_hold_scatter(holds, annotate=annotate_holds, ax=ax)
@@ -581,7 +814,6 @@ def plot_climb_sequence(
     # Neutral arrows connecting moves in order. Dynamic moves get a yellow
     # rim and thicker line so the cut/replant pattern is visually obvious.
     arrow_color = "#ffffff"
-    arrow_edge = "#000000"
     for i in range(1, len(points_px)):
         prev_x, prev_y, _ = points_px[i - 1]
         curr_x, curr_y, _ = points_px[i]
@@ -611,49 +843,16 @@ def plot_climb_sequence(
     if draw_body:
         bodies = compute_bodies_along_sequence(holds, sequence)
         if bodies:
-            # First pose faded (starting posture).
             _draw_body(ax, bodies[0], alpha=0.30, zorder=8)
-            # Last pose solid (finishing posture).
             _draw_body(ax, bodies[-1], alpha=0.95, zorder=9)
 
     ax.legend(handles=_role_legend_handles(), loc="upper right",
               framealpha=0.85, fontsize=9)
     ax.set_title(title)
 
-    if include_stats:
-        start_count = len([h for h in holds if h.get("role_id") == 12])
-        hand_count = len([h for h in holds if h.get("role_id") == 13])
-        finish_count = len([h for h in holds if h.get("role_id") == 14])
-        foot_count = len([h for h in holds if h.get("role_id") == 15])
-        stats = compute_sequence_stats(holds, sequence)
-        info_lines = [
-            f"Moves: {len(sequence)}",
-            f"Start Holds: {start_count}",
-            f"Hand Holds: {hand_count}",
-            f"Finish Holds: {finish_count}",
-            f"Foot Holds: {foot_count}",
-        ]
-        if stats:
-            info_lines.extend(
-                [
-                    f"Avg Move: {stats['avg_distance']:.1f}",
-                    f"Max Move: {stats['max_distance']:.1f}",
-                    f"Height Gain: {stats['height_gain']:.1f}",
-                ]
-            )
-        dyn_tags = classify_dynamic_moves(holds, sequence)
-        n_dyn = sum(1 for t in dyn_tags if t.get('is_dynamic'))
-        n_replant = sum(1 for t in dyn_tags if t.get('is_replant'))
-        if n_dyn or n_replant:
-            info_lines.append(f"Dynamic Moves: {n_dyn}")
-            info_lines.append(f"Replants: {n_replant}")
-        fig.text(
-            0.02,
-            0.02,
-            "\n".join(info_lines),
-            fontsize=9,
-            bbox=dict(facecolor="white", alpha=0.85, edgecolor="gray"),
-        )
+    beta_lines = _format_beta_steps(holds, sequence, dyn_tags)
+    stats_lines = _build_stats_lines(holds, sequence, dyn_tags) if include_stats else []
+    _render_beta_panel(panel, beta_lines, stats_lines, active_idx=None)
 
     plt.tight_layout()
 
@@ -779,6 +978,172 @@ def plot_sequence_cycle(
         plt.savefig(output_path, dpi=150)
     if show:
         plt.show()
+    plt.close(fig)
+
+
+def plot_climb_sequence_animated(
+    holds: List[Dict],
+    sequence: List[Dict],
+    title: str,
+    output_path: str,
+    fps: float = 1.2,
+    annotate_holds: bool = False,
+    draw_body: bool = False,
+    hold_frame: int = 2,
+) -> None:
+    """Render the climb as an animated GIF that walks through each move with
+    a readable beta panel on the right (current step highlighted).
+
+    `hold_frame` repeats the final frame so the viewer sees the completed
+    sequence at the end of the loop. Output extension determines writer
+    (.gif requires Pillow; .mp4 requires ffmpeg). On writer failure falls
+    back to a contact-sheet PNG.
+    """
+    from matplotlib.animation import FuncAnimation, PillowWriter
+
+    if not holds or not sequence:
+        raise ValueError("Climb has no holds or sequence")
+
+    points_px = _sequence_points_px(holds, sequence)
+    dyn_tags = classify_dynamic_moves(holds, sequence)
+    beta_lines = _format_beta_steps(holds, sequence, dyn_tags)
+    stats_lines = _build_stats_lines(holds, sequence, dyn_tags)
+    bodies = compute_bodies_along_sequence(holds, sequence) if draw_body else []
+
+    _, img_w, img_h = _load_board_image()
+    fig_w = 10.0
+    fig_h = fig_w * (img_h / img_w)
+    panel_frac = 0.48
+    total_w = fig_w * (1.0 + panel_frac)
+    fig = plt.figure(figsize=(total_w, fig_h))
+    gs = fig.add_gridspec(1, 2, width_ratios=[1.0, panel_frac], wspace=0.04)
+    ax = fig.add_subplot(gs[0, 0])
+    panel = fig.add_subplot(gs[0, 1])
+    _setup_board_axes(ax)
+    _draw_hold_scatter(holds, annotate=annotate_holds, ax=ax)
+
+    # Faded full path so the viewer sees the whole route while the active
+    # move marker advances through it.
+    for i in range(1, len(points_px)):
+        px0, py0, _ = points_px[i - 1]
+        px1, py1, _ = points_px[i]
+        tag = dyn_tags[i] if i < len(dyn_tags) else {}
+        dyn = tag.get("is_dynamic")
+        ax.annotate(
+            "",
+            xy=(px1, py1),
+            xytext=(px0, py0),
+            arrowprops=dict(
+                arrowstyle="-|>",
+                color="#f1c40f" if dyn else "white",
+                lw=2.2 if dyn else 1.4,
+                alpha=0.55 if dyn else 0.30,
+                shrinkA=10, shrinkB=12,
+                mutation_scale=12,
+            ),
+            zorder=6,
+        )
+    for i, (x, y, _limb) in enumerate(points_px):
+        ax.scatter(x, y, s=130, facecolor="white", edgecolor="black",
+                   linewidth=1.0, alpha=0.40, zorder=7)
+        ax.text(x, y, str(i + 1), fontsize=8, ha="center", va="center",
+                color="black", alpha=0.55, zorder=8)
+
+    ax.legend(handles=_role_legend_handles(), loc="upper right",
+              framealpha=0.85, fontsize=9)
+
+    cur_marker = ax.scatter([], [], s=320, facecolor="white",
+                            edgecolor="black", linewidth=1.8, zorder=15)
+    cur_label = ax.text(0, 0, "", fontsize=10, ha="center", va="center",
+                        color="black", fontweight="bold", zorder=16, visible=False)
+
+    body_artists: List = []
+
+    def _frame_index(frame: int) -> int:
+        return min(frame, len(points_px) - 1)
+
+    def _render(frame: int):
+        i = _frame_index(frame)
+        x, y, limb = points_px[i]
+        cur_marker.set_offsets([[x, y]])
+        cur_label.set_position((x, y))
+        cur_label.set_text(str(i + 1))
+        cur_label.set_visible(True)
+        tag = dyn_tags[i] if i < len(dyn_tags) else {}
+        suffix = ""
+        if tag.get("is_dynamic"):
+            suffix = f"  [DYN — cut {tag.get('cut_limb')}]"
+        elif tag.get("is_replant"):
+            suffix = "  [replant]"
+        ax.set_title(f"{title} — Move {i+1}/{len(points_px)} — {limb}{suffix}")
+        _render_beta_panel(panel, beta_lines, stats_lines, active_idx=i)
+        for art in body_artists:
+            try:
+                art.remove()
+            except Exception:
+                pass
+        body_artists.clear()
+        if draw_body and i < len(bodies):
+            body_artists.extend(_draw_body(ax, bodies[i], alpha=1.0))
+        return [cur_marker, cur_label, *body_artists]
+
+    n_frames = len(points_px) + max(0, hold_frame)
+    interval_ms = max(50, int(1000.0 / max(fps, 0.1)))
+    anim = FuncAnimation(
+        fig, _render, frames=n_frames, interval=interval_ms, blit=False,
+    )
+
+    ext = os.path.splitext(output_path)[1].lower()
+    try:
+        if ext == ".gif":
+            anim.save(output_path, writer=PillowWriter(fps=fps), dpi=110)
+        elif ext == ".mp4":
+            anim.save(output_path, fps=fps, dpi=110)
+        else:
+            _save_contact_sheet(fig, points_px, bodies, sequence, dyn_tags,
+                                title, output_path)
+    except Exception as exc:
+        print(f"  [animation] {ext} writer failed ({exc}); writing contact sheet")
+        sheet_path = os.path.splitext(output_path)[0] + "_steps.png"
+        _save_contact_sheet(fig, points_px, bodies, sequence, dyn_tags,
+                            title, sheet_path)
+
+    plt.close(fig)
+
+
+def _save_contact_sheet(_unused_fig, points_px, bodies, sequence, dyn_tags,
+                        title: str, output_path: str) -> None:
+    """Fallback when an animation writer is unavailable: render a grid of
+    per-step stick-figure frames as a single PNG."""
+    n = len(points_px)
+    cols = min(4, max(2, n))
+    rows = int(math.ceil(n / cols))
+    _, img_w, img_h = _load_board_image()
+    aspect = img_h / img_w
+    fig_w = 4.0 * cols
+    fig_h = 4.0 * aspect * rows
+    fig, axes = plt.subplots(rows, cols, figsize=(fig_w, fig_h))
+    axes_list = (axes.flat if hasattr(axes, "flat") else [axes]) if n > 1 else [axes]
+    for i, ax in enumerate(axes_list):
+        if i >= n:
+            ax.axis("off")
+            continue
+        _setup_board_axes(ax)
+        # Skip per-hold scatter to keep panels light; just draw the move marker
+        # and the stick figure.
+        x, y, limb = points_px[i]
+        ax.scatter([x], [y], s=180, facecolor="white", edgecolor="black",
+                   linewidth=1.2, zorder=10)
+        ax.text(x, y, str(i + 1), fontsize=8, ha="center", va="center",
+                color="black", fontweight="bold", zorder=11)
+        if i < len(bodies):
+            _draw_body(ax, bodies[i], alpha=1.0)
+        tag = dyn_tags[i] if i < len(dyn_tags) else {}
+        suffix = "  [DYN]" if tag.get("is_dynamic") else ""
+        ax.set_title(f"{i+1}/{n}  {limb}{suffix}", fontsize=10)
+    fig.suptitle(title, fontsize=11)
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=110)
     plt.close(fig)
 
 

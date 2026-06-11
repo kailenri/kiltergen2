@@ -736,6 +736,15 @@ class ClimbSequenceGenerator:
                             })
 
             #feeeet
+            # Pressure to plant a foot when the recent move history is hand-heavy:
+            # if the last 2 sequence moves were both hands, multiply foot expansion
+            # scores by HAND_STREAK_FOOT_BOOST so the beam doesn't drift into
+            # hand-only chains (root cause of empty-foot training data, pre-Phase A).
+            recent = state['sequence'][-2:]
+            hand_streak = (len(recent) >= 2 and
+                           all(m['limb'] in ('RH', 'LH') for m in recent))
+            foot_streak_boost = 1.5 if hand_streak else 1.0
+
             for limb in ['RF', 'LF']:
                 # If feet are cut, only the cut foot may move (replant gate).
                 if cut_feet and FOOT_CUT_ENABLED and limb not in cut_feet:
@@ -758,13 +767,16 @@ class ClimbSequenceGenerator:
                         was_flagging = new_flags.get(limb) is not None
                         new_flags[limb] = None
 
-                        #lower scores for foot movements; small bonus when this
-                        #move is a replant restoring tension.
-                        move_score = 0.5
+                        # Foot base score raised 0.5 -> 2.5 so feet can compete
+                        # with hand-coverage (~9) and finish (~10) scores in
+                        # beam pruning; without this the beam never keeps
+                        # foot expansions and training data ends up hand-only.
+                        move_score = 2.5
                         if cut_feet and limb in cut_feet:
                             move_score += 2.0
                         if was_flagging:
                             move_score += 1.0  # reward landing from a flag
+                        move_score *= foot_streak_boost
 
                         new_states.append({
                             'sequence': state['sequence'] + [{
@@ -780,58 +792,107 @@ class ClimbSequenceGenerator:
 
         return new_states
 
+    def _select_initial_feet(self, rh_hold: Dict, lh_hold: Dict):
+        """Pick the best (RF, LF) holds for a given hand-start configuration.
+
+        A climber pulls onto the wall with feet — without this seeding the
+        beam runs as a hand-only chain because no support polygon exists
+        for `is_dynamic_hand_move` to detect cuts. Returns (rf_hold, lf_hold);
+        either may be None when nothing reachable.
+
+        Selection: per side, pick the foot hold minimising
+            distance(hand) + 2 * max(0, foot_y - hand_y)  -  5 if on correct side
+        within `MAX_FOOT_REACH` of the hand. RF/LF are assigned distinct holds.
+        """
+        midx = (rh_hold['x'] + lh_hold['x']) / 2.0
+        skip_ids = {rh_hold['hole_id'], lh_hold['hole_id']}
+
+        def ranked_candidates(hand_xy, prefer_right: bool):
+            out = []
+            for h in self.foot_holds:
+                if h['hole_id'] in skip_ids:
+                    continue
+                d = math.hypot(h['x'] - hand_xy[0], h['y'] - hand_xy[1])
+                if d > MAX_FOOT_REACH:
+                    continue
+                side_match = (h['x'] >= midx) if prefer_right else (h['x'] <= midx)
+                y_above = max(0.0, h['y'] - hand_xy[1])  # penalise feet above hand
+                cost = d + 2.0 * y_above - (5.0 if side_match else 0.0)
+                out.append((cost, h))
+            out.sort(key=lambda x: x[0])
+            return [h for _, h in out]
+
+        rf_list = ranked_candidates((rh_hold['x'], rh_hold['y']), prefer_right=True)
+        lf_list = ranked_candidates((lh_hold['x'], lh_hold['y']), prefer_right=False)
+
+        rf = rf_list[0] if rf_list else None
+        lf = None
+        for cand in lf_list:
+            if rf is None or cand['hole_id'] != rf['hole_id']:
+                lf = cand
+                break
+        return rf, lf
+
     def _initialize_beam(self):
         #initilize with start positions
         beam = []
 
-        def _start_seq(rh_hold, lh_hold):
-            # Emit the matched-start as the first two recorded moves so the
-            # rendered sequence begins on the start holds.
-            return [
+        def _start_seq(rh_hold, lh_hold, rf_hold, lf_hold):
+            # Emit the matched-start as recorded moves so the rendered
+            # sequence begins on the start holds (and start feet, if any).
+            seq = [
                 {'limb': 'RH', 'hold': rh_hold['hole_id'],
                  'position': rh_hold.get('position')},
                 {'limb': 'LH', 'hold': lh_hold['hole_id'],
                  'position': lh_hold.get('position')},
             ]
+            if rf_hold is not None:
+                seq.append({'limb': 'RF', 'hold': rf_hold['hole_id'],
+                            'position': rf_hold.get('position')})
+            if lf_hold is not None:
+                seq.append({'limb': 'LF', 'hold': lf_hold['hole_id'],
+                            'position': lf_hold.get('position')})
+            return seq
 
         #just hands on start holds
         for rh in self.start_holds:
             for lh in self.start_holds:
                 if rh != lh:  # Different holds for each hand
-                    # Initial state with just hands positioned
+                    rf, lf = self._select_initial_feet(rh, lh)
                     beam.append({
-                        'sequence': _start_seq(rh, lh),
+                        'sequence': _start_seq(rh, lh, rf, lf),
                         'limbs': {
-                            'RH': rh, 
+                            'RH': rh,
                             'LH': lh,
-                            'RF': None,
-                            'LF': None
+                            'RF': rf,
+                            'LF': lf,
                         },
                         'cut_feet': frozenset(),
                         'flags': {'RF': None, 'LF': None},
                         'score': 0
                     })
-        
+
         #allowing the same hold for both hands
         if not beam and self.start_holds:
             for h in self.start_holds:
+                rf, lf = self._select_initial_feet(h, h)
                 beam.append({
-                    'sequence': _start_seq(h, h),
+                    'sequence': _start_seq(h, h, rf, lf),
                     'limbs': {
-                        'RH': h, 
+                        'RH': h,
                         'LH': h,
-                        'RF': None,
-                        'LF': None
+                        'RF': rf,
+                        'LF': lf,
                     },
                     'cut_feet': frozenset(),
                     'flags': {'RF': None, 'LF': None},
                     'score': 0
                 })
-        
+
         #check for starting positions
         if not beam:
             raise ValueError("Could not create valid starting positions")
-            
+
         return beam
 
     def _score_initial_position(self, state):
