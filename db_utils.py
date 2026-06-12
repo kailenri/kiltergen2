@@ -112,3 +112,12 @@ def parse_frames_string(frames: str, conn: sqlite3.Connection) -> List[Dict]:
             continue
     
     return holds
+
+
+def main():
+    processed = process_climbs()
+    print(f"Processed {len(processed)} climbs")
+
+
+if __name__ == "__main__":
+    main()

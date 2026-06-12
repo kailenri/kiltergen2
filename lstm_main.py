@@ -9,6 +9,15 @@ from pathlib import Path
 
 from lstm import ClimbGenerator
 
+
+def init_generator(data_path, model_path=None, vocab_path=None):
+    generator = ClimbGenerator(data_path, vocab_path=vocab_path)
+    if model_path:
+        if not generator.load_model(model_path):
+            print("Failed to load model. Exiting.")
+            return None
+    return generator
+
 def setup_parser():
     parser = argparse.ArgumentParser(
         description="Train and generate climbing sequences using adapted LSTM model"
@@ -42,6 +51,30 @@ def setup_parser():
         "--output", 
         default="lstm_model.pth", 
         help="Path to save trained model"
+    )
+    train_parser.add_argument(
+        "--vocab",
+        help="Path to vocab.json to load or save",
+    )
+    train_parser.add_argument(
+        "--checkpoint-dir",
+        help="Directory to save checkpoints (optional)",
+    )
+    train_parser.add_argument(
+        "--checkpoint-freq",
+        type=int,
+        default=5,
+        help="Save a checkpoint every N epochs",
+    )
+    train_parser.add_argument(
+        "--tb-logdir",
+        help="TensorBoard log directory (optional)",
+    )
+    train_parser.add_argument(
+        "--reinforce-weight",
+        type=float,
+        default=0.0,
+        help="Weight for REINFORCE policy-gradient loss (0=disabled). Recommended 0.01–0.05.",
     )
     
 
@@ -88,6 +121,10 @@ def setup_parser():
         action="store_true", 
         help="Export sequences as JSON file"
     )
+    gen_parser.add_argument(
+        "--vocab",
+        help="Path to vocab.json to load (optional)",
+    )
     
     #Visualize mode
     vis_parser = subparsers.add_parser("visualize", help="Visualize climbing sequences")
@@ -122,25 +159,56 @@ def setup_parser():
         default="visualizations", 
         help="Directory to save visualizations"
     )
+    vis_parser.add_argument(
+        "--viz-type",
+        default="path",
+        choices=["path", "cycle", "reachability-hand", "reachability-foot", "hold-density"],
+        help="Type of visualization to generate",
+    )
+    vis_parser.add_argument(
+        "--vocab",
+        help="Path to vocab.json to load (optional)",
+    )
     
     return parser
 
 def train_model(args):
     print(f"Starting training with data from: {args.data}")
     print(f"Training parameters: epochs={args.epochs}, batch_size={args.batch_size}, lr={args.learning_rate}")
-    generator = ClimbGenerator(args.data)
+    generator = init_generator(args.data, vocab_path=args.vocab)
     
+    # ensure output directory exists
+    out_dir = os.path.dirname(args.output)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+
     #train LSTM
     train_losses, val_losses = generator.train(
         num_epochs=args.epochs,
         batch_size=args.batch_size,
         learning_rate=args.learning_rate,
-        save_path=args.output
+        save_path=args.output,
+        checkpoint_dir=args.checkpoint_dir,
+        checkpoint_freq=args.checkpoint_freq,
+        tb_logdir=args.tb_logdir,
+        reinforce_weight=args.reinforce_weight,
     )
     
     print(f"Training complete. Model saved to {args.output}")
     print(f"Training loss history saved to training_history.png")
-    
+    # Save vocab alongside the model for reproducibility
+    try:
+        if args.vocab:
+            vocab_path = args.vocab
+        else:
+            base = os.path.splitext(args.output)[0]
+            vocab_path = f"{base}_vocab.json"
+
+        generator.dataset.save_vocab(vocab_path)
+        print(f"Saved vocabulary to {vocab_path}")
+    except Exception as e:
+        print(f"Warning: failed to save vocab: {e}")
+
     return generator
 
 def generate_sequences(args):
@@ -150,9 +218,8 @@ def generate_sequences(args):
     os.makedirs(args.output_dir, exist_ok=True)
     
     #Initialize generator and load model
-    generator = ClimbGenerator(args.data)
-    if not generator.load_model(args.model):
-        print("Failed to load model. Exiting.")
+    generator = init_generator(args.data, args.model, vocab_path=args.vocab)
+    if not generator:
         return
     
     #gen sequences
@@ -177,9 +244,8 @@ def visualize_sequences(args):
     os.makedirs(args.output_dir, exist_ok=True)
     
     #load model
-    generator = ClimbGenerator(args.data)
-    if not generator.load_model(args.model):
-        print("Failed to load model. Exiting.")
+    generator = init_generator(args.data, args.model, vocab_path=args.vocab)
+    if not generator:
         return
     
     #gen
@@ -205,7 +271,8 @@ def visualize_sequences(args):
         generator.visualize_sequence(
             sequence=seq['sequence'],
             climb_id=seq['climb_id'],
-            save_path=filename
+            save_path=filename,
+            viz_type=args.viz_type
         )
         print(f"Visualization {i+1} saved to {filename}")
     

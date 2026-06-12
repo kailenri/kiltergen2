@@ -7,6 +7,32 @@ from sequence_generator import ClimbSequenceGenerator
 from config import *
 import warnings
 
+
+def write_results(results, total_processed):
+    successful = sum(1 for r in results if 'best_sequence' in r)
+    failed = sum(1 for r in results if 'error' in r)
+
+    output_file = f"climb_results_{int(time.time())}.json"
+    with open(output_file, 'w') as f:
+        json.dump({
+            'metadata': {
+                'total_attempted': total_processed,
+                'successful': successful,
+                'failed': failed,
+                'parameters': {
+                    'max_climbs': MAX_CLIMBS_TO_PROCESS,
+                    'max_holds': MAX_HOLDS_PER_CLIMB,
+                    'min_holds': MIN_HOLDS_PER_CLIMB,
+                    'beam_width': BEAM_WIDTH,
+                    'max_hand_reach': MAX_HAND_REACH,
+                    'max_foot_reach': MAX_FOOT_REACH
+                }
+            },
+            'results': results
+        }, f, indent=2)
+
+    return output_file, successful, failed
+
 def get_climbs_batch(offset: int, limit: int) -> List[Dict]:
     conn = sqlite3.connect(DB_PATH)
     try:
@@ -130,30 +156,8 @@ def main():
                     
             total_processed += len(climbs)
     
-    #Calculate statistics about the results
-    successful = sum(1 for r in results if 'best_sequence' in r)
-    failed = sum(1 for r in results if 'error' in r)
-    
-    #Save results with metadata
-    output_file = f"climb_results_{int(time.time())}.json"
-    with open(output_file, 'w') as f:
-        json.dump({
-            'metadata': {
-                'total_attempted': total_processed,
-                'successful': successful,
-                'failed': failed,
-                'parameters': {
-                    'max_climbs': MAX_CLIMBS_TO_PROCESS,
-                    'max_holds': MAX_HOLDS_PER_CLIMB,
-                    'min_holds': MIN_HOLDS_PER_CLIMB,
-                    'beam_width': BEAM_WIDTH,
-                    'max_hand_reach': MAX_HAND_REACH,
-                    'max_foot_reach': MAX_FOOT_REACH
-                }
-            },
-            'results': results
-        }, f, indent=2)
-    
+    output_file, successful, failed = write_results(results, total_processed)
+
     print(f"\nProcessing complete. Saved results to {output_file}")
     print(f"Successful: {successful}")
     print(f"Failed: {failed}")

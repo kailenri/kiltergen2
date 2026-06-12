@@ -56,17 +56,18 @@ def extract_holds_in(db_path, table_name, limit=0):
         conn.close()
         return []
     
-    #get columns for query
-    columns_to_fetch = ['uuid']
-    if 'name' in columns:
-        columns_to_fetch.append('name')
-    columns_to_fetch.append('holds_in')
-
-    query = f"SELECT {', '.join(columns_to_fetch)} FROM {table_name} WHERE holds_in IS NOT NULL"
-    
-    if limit > 0:
-        query += f" LIMIT {limit}"
-    
+    # Query with LEFT JOIN to climb_stats to pull community-consensus difficulty.
+    # AVG across angles gives one difficulty value per climb.
+    limit_clause = f" LIMIT {limit}" if limit > 0 else ""
+    query = (
+        f"SELECT c.uuid, c.name, c.holds_in, "
+        f"ROUND(AVG(cs.difficulty_average)) AS difficulty "
+        f"FROM {table_name} c "
+        f"LEFT JOIN climb_stats cs ON c.uuid = cs.climb_uuid "
+        f"WHERE c.holds_in IS NOT NULL "
+        f"GROUP BY c.uuid"
+        f"{limit_clause}"
+    )
     print(f"Executing query: {query}")
     cursor.execute(query)
     rows = cursor.fetchall()
@@ -82,6 +83,7 @@ def extract_holds_in(db_path, table_name, limit=0):
             result = {
                 "id": row['uuid'],
                 "name": row['name'] if 'name' in row.keys() else f"Climb {len(results) + 1}",
+                "difficulty": row['difficulty'],
                 "best_sequence": {
                     "holds": holds_in,
                     "sequence": generate_sequence_from_holds(holds_in)
