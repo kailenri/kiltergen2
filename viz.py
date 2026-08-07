@@ -356,8 +356,33 @@ def compute_sequence_stats(holds: List[Dict], sequence: List[Dict]) -> Dict[str,
     }
 
 
-# --- Human-readable beta side panel ----------------------------------------
+# Phase colors — used on board arrows/badges and beta panel text.
+_PHASE_COLORS = {
+    'static':     '#2ecc71',  # green  — balanced, in-control
+    'committing': '#f39c12',  # amber  — one-foot stance / cross / lock-off
+    'dynamic':    '#e74c3c',  # red    — committed dyno
+    'recovery':   '#3498db',  # blue   — replant / unflag
+}
 
+# Verb table for _format_beta_steps. Keys match transition_type values emitted
+# by the beam; fallback to geometry-derived verbs.
+_TTYPE_VERB = {
+    'start_hand':      'start on',
+    'start_foot':      'start on',
+    'match':           'match feet on',
+    'foot_swap':       'swap feet to',
+    'back_step':       'back step to',
+    'high_step':       'high step to',
+    'step_up':         'step up to',
+    'foot_move':       'step to',
+    'replant':         'replant on',
+    'unflag':          'unflag to',
+    'dyno':            'deadpoint to',
+    'cross':           'cross to',
+    'lock_off':        'lock off to',
+    'hand_move':       'reach to',
+    'finish':          'top out on',
+}
 _ROLE_LABEL_SHORT = {12: "start", 13: "crimp", 14: "FINISH", 15: "foot"}
 _LIMB_LABEL_LONG = {"RH": "Right Hand", "LH": "Left Hand",
                     "RF": "Right Foot", "LF": "Left Foot"}
@@ -382,7 +407,11 @@ def _direction_phrase(dx: float, dy: float) -> str:
 def _format_beta_steps(
     holds: List[Dict], sequence: List[Dict], dyn_tags: List[Dict]
 ) -> List[str]:
-    """Produce one human-readable beta line per move."""
+    """Produce one human-readable beta line per move.
+
+    Verb-first format: "5. Right Hand  deadpoint to crimp (32")  [cut LF]"
+    Falls back to direction phrases for legacy JSON without transition_type.
+    """
     hold_map = _build_hold_map(holds)
     limb_positions: Dict[str, Optional[Tuple[float, float]]] = {
         "RH": None, "LH": None, "RF": None, "LF": None,
@@ -397,18 +426,46 @@ def _format_beta_steps(
         new_xy = (hold.get("x", 0), hold.get("y", 0)) if hold else None
 
         prev_xy = limb_positions.get(limb)
-        if prev_xy is None or new_xy is None:
-            phrase = "place on " + role
+        dist_str = ""
+        if prev_xy is not None and new_xy is not None:
+            dx = new_xy[0] - prev_xy[0]
+            dy = new_xy[1] - prev_xy[1]
+            dist = math.hypot(dx, dy)
+            dist_str = f" ({int(round(dist))}\")"
+
+        # Prefer beam-emitted transition_type verb; fall back to geometry.
+        ttype = move.get("transition_type")
+        if ttype and ttype in _TTYPE_VERB:
+            verb = _TTYPE_VERB[ttype]
+        elif prev_xy is None or new_xy is None:
+            verb = "place on"
         else:
             dx = new_xy[0] - prev_xy[0]
             dy = new_xy[1] - prev_xy[1]
-            phrase = f"{_direction_phrase(dx, dy)} to {role}"
+            if limb in ('RF', 'LF'):
+                if abs(dx) < 1.0 and abs(dy) < 1.0:
+                    verb = "match feet on"
+                elif dy > X_SPACING * 1.5:
+                    verb = "high step to"
+                elif dy > X_SPACING * 0.3:
+                    verb = "step up to"
+                elif dy < -X_SPACING * 0.3:
+                    verb = "drop down to"
+                else:
+                    verb = "step to"
+            else:
+                if abs(dx) < 1.0 and abs(dy) < 1.0:
+                    verb = "bump to"
+                else:
+                    verb = f"{_direction_phrase(dx, dy)} to"
+
+        phrase = f"{verb} {role}{dist_str}"
 
         tag = dyn_tags[i] if i < len(dyn_tags) else {}
         flags = []
         if tag.get("is_dynamic"):
             cut = tag.get("cut_limb")
-            flags.append(f"DYNO, cut {cut}" if cut else "DYNO")
+            flags.append(f"cut {cut}" if cut else "DYNO")
         if tag.get("is_replant"):
             flags.append("replant")
         if tag.get("flag_limb"):
@@ -448,11 +505,15 @@ def _build_stats_lines(holds: List[Dict], sequence: List[Dict],
 def _render_beta_panel(
     panel, beta_lines: List[str], stats_lines: List[str],
     active_idx: Optional[int] = None,
+    phase_colors: Optional[List[str]] = None,
 ) -> None:
     """Draw the beta + stats text into the right-side panel axes.
 
     `active_idx` highlights one step (used by the GIF). Pass None for the
     static plot to show every step at equal weight.
+    `phase_colors` is an optional per-line color list matching `beta_lines`;
+    when supplied (static view) it overrides the flat default so board badges
+    and beta text share the same phase color.
     """
     panel.clear()
     panel.axis("off")
@@ -470,7 +531,9 @@ def _render_beta_panel(
     y = 0.94
     for i, line in enumerate(beta_lines):
         if active_idx is None:
-            color = "#222222"
+            # Static view: use phase color when available, else neutral.
+            color = (phase_colors[i] if phase_colors and i < len(phase_colors)
+                     else "#222222")
             weight = "normal"
             marker = "  "
         elif i == active_idx:
@@ -510,18 +573,20 @@ def classify_dynamic_moves(holds: List[Dict], sequence: List[Dict]) -> List[Dict
       - 'is_replant': bool — this foot move re-plants a previously cut foot
       - 'flag_limb': 'LF'|'RF'|None — which foot was put into a flag by this move
       - 'is_unflag': bool — this foot move replants from a flag
+      - 'phase': 'static'|'committing'|'dynamic'|'recovery' — beginner-facing phase
     """
     hold_map = _build_hold_map(holds)
     limb_positions = {'RH': None, 'LH': None, 'RF': None, 'LF': None}
     cut_feet = set()
     flags = {'RF': None, 'LF': None}
+    # Track which feet are planted each step to detect committing (1-foot stance).
     tags = []
 
     for move in sequence:
         limb = move.get('limb')
         hold = hold_map.get(move.get('hold'))
         tag = {'is_dynamic': False, 'cut_limb': None, 'is_replant': False,
-               'flag_limb': None, 'is_unflag': False}
+               'flag_limb': None, 'is_unflag': False, 'phase': 'static'}
         if hold is None or limb not in limb_positions:
             tags.append(tag)
             continue
@@ -540,6 +605,7 @@ def classify_dynamic_moves(holds: List[Dict], sequence: List[Dict]) -> List[Dict
                 if cut is not None:
                     tag['is_dynamic'] = True
                     tag['cut_limb'] = cut
+                    tag['phase'] = 'dynamic'
                     cut_feet.add(cut)
                     limb_positions[cut] = None
                     flags[cut] = None
@@ -555,13 +621,30 @@ def classify_dynamic_moves(holds: List[Dict], sequence: List[Dict]) -> List[Dict
                             flags[flag_foot] = compute_flag_position(hip, new_xy, flag_foot)
                             limb_positions[flag_foot] = None
                             tag['flag_limb'] = flag_foot
+                            tag['phase'] = 'committing'
+            # Committing: after this hand move only one foot is planted.
+            if not tag['is_dynamic'] and not tag['flag_limb']:
+                feet_planted = sum(1 for f in ('RF', 'LF') if limb_positions[f] is not None)
+                if feet_planted <= 1:
+                    tag['phase'] = 'committing'
         elif FOOT_CUT_ENABLED and limb in cut_feet:
             tag['is_replant'] = True
+            tag['phase'] = 'recovery'
             cut_feet.discard(limb)
             flags[limb] = None
         elif limb in ('RF', 'LF') and flags.get(limb) is not None:
             tag['is_unflag'] = True
+            tag['phase'] = 'recovery'
             flags[limb] = None
+
+        # Preserve transition_type-derived phase when the beam has tagged the move.
+        beam_ttype = move.get('transition_type')
+        if beam_ttype == 'dyno':
+            tag['phase'] = 'dynamic'
+        elif beam_ttype in ('replant', 'unflag'):
+            tag['phase'] = 'recovery'
+        elif beam_ttype in ('back_step', 'high_step', 'cross', 'lock_off') and tag['phase'] == 'static':
+            tag['phase'] = 'committing'
 
         limb_positions[limb] = new_xy
         tags.append(tag)
@@ -790,6 +873,7 @@ def plot_climb_sequence(
     annotate_holds: bool = False,
     include_stats: bool = True,
     draw_body: bool = False,
+    keyframe: Optional[int] = None,
 ) -> None:
     if not holds or not sequence:
         raise ValueError("Climb has no holds or sequence")
@@ -797,7 +881,6 @@ def plot_climb_sequence(
     _, img_w, img_h = _load_board_image()
     fig_w = 10.0
     fig_h = fig_w * (img_h / img_w)
-    # Wider canvas to hold a right-side beta panel beside the board.
     panel_frac = 0.48
     total_w = fig_w * (1.0 + panel_frac)
     fig = plt.figure(figsize=(total_w, fig_h))
@@ -811,48 +894,104 @@ def plot_climb_sequence(
     points_px = _sequence_points_px(holds, sequence)
     dyn_tags = classify_dynamic_moves(holds, sequence)
 
-    # Neutral arrows connecting moves in order. Dynamic moves get a yellow
-    # rim and thicker line so the cut/replant pattern is visually obvious.
-    arrow_color = "#ffffff"
+    # Per-move phase colors for arrows and badges.
+    move_colors = [
+        _PHASE_COLORS.get(t.get('phase', 'static'), '#ffffff')
+        for t in dyn_tags
+    ]
+
+    # Arrows connecting moves, colored by the destination move's phase.
     for i in range(1, len(points_px)):
         prev_x, prev_y, _ = points_px[i - 1]
         curr_x, curr_y, _ = points_px[i]
+        arrow_c = move_colors[i] if i < len(move_colors) else '#ffffff'
         tag = dyn_tags[i] if i < len(dyn_tags) else {}
-        dyn = tag.get('is_dynamic')
+        lw = 3.2 if tag.get('is_dynamic') else 2.0
         ax.annotate(
             "",
             xy=(curr_x, curr_y),
             xytext=(prev_x, prev_y),
             arrowprops=dict(
                 arrowstyle="-|>",
-                color="#f1c40f" if dyn else arrow_color,
-                lw=3.2 if dyn else 2.0,
+                color=arrow_c,
+                lw=lw,
                 shrinkA=10, shrinkB=14,
                 mutation_scale=14,
             ),
             zorder=8,
         )
 
-    # Numbered step badges on each move.
+    # Numbered step badges — facecolor matches phase, edge contrasts.
     for i, (x, y, _limb) in enumerate(points_px):
-        ax.scatter(x, y, s=180, facecolor="white", edgecolor="black",
+        badge_c = move_colors[i] if i < len(move_colors) else '#ffffff'
+        ax.scatter(x, y, s=180, facecolor=badge_c, edgecolor='black',
                    linewidth=1.2, zorder=10)
-        ax.text(x, y, str(i + 1), fontsize=9, ha="center", va="center",
-                color="black", zorder=11, fontweight="bold")
+        # Dark text on light badges, white text on dark.
+        _r, _g, _b = (
+            int(badge_c[1:3], 16) / 255,
+            int(badge_c[3:5], 16) / 255,
+            int(badge_c[5:7], 16) / 255,
+        ) if badge_c.startswith('#') and len(badge_c) == 7 else (1, 1, 1)
+        luma = 0.2126 * _r + 0.7152 * _g + 0.0722 * _b
+        text_c = '#111111' if luma > 0.45 else '#ffffff'
+        ax.text(x, y, str(i + 1), fontsize=9, ha='center', va='center',
+                color=text_c, zorder=11, fontweight='bold')
 
-    if draw_body:
-        bodies = compute_bodies_along_sequence(holds, sequence)
-        if bodies:
-            _draw_body(ax, bodies[0], alpha=0.30, zorder=8)
-            _draw_body(ax, bodies[-1], alpha=0.95, zorder=9)
+    # Phase legend in the top-left corner of the board axes.
+    _phase_legend_handles = [
+        plt.Line2D([0], [0], marker='o', color='w',
+                   markerfacecolor=_PHASE_COLORS[p], markeredgecolor='black',
+                   markersize=9, label=p.capitalize())
+        for p in ('static', 'committing', 'dynamic', 'recovery')
+    ]
+    phase_legend = ax.legend(handles=_phase_legend_handles, loc='upper left',
+                              framealpha=0.80, fontsize=8, title='Phase')
+    ax.add_artist(phase_legend)
 
-    ax.legend(handles=_role_legend_handles(), loc="upper right",
+    # Body overlay: draw a faint stick-figure at the crux (most committing) step.
+    bodies = compute_bodies_along_sequence(holds, sequence) if (draw_body or True) else []
+    if bodies:
+        # Auto-detect crux as the dynamic step, else first committing, else middle.
+        if keyframe is not None:
+            kf = max(0, min(keyframe, len(bodies) - 1))
+        else:
+            kf = next(
+                (i for i, t in enumerate(dyn_tags) if t.get('phase') == 'dynamic'),
+                next(
+                    (i for i, t in enumerate(dyn_tags) if t.get('phase') == 'committing'),
+                    len(bodies) // 2,
+                ),
+            )
+        _draw_body(ax, bodies[kf], alpha=0.25, zorder=8)
+        # Hip-shift arrow: from crux hip to next-move hip (if available).
+        if kf + 1 < len(bodies):
+            b_now = bodies[kf]
+            b_next = bodies[kf + 1]
+            if b_now.hip and b_next.hip:
+                hip_px_now = _body_xy_to_px(b_now.hip)
+                hip_px_next = _body_xy_to_px(b_next.hip)
+                ax.annotate(
+                    "",
+                    xy=hip_px_next,
+                    xytext=hip_px_now,
+                    arrowprops=dict(
+                        arrowstyle='-|>',
+                        color='#ffffff',
+                        lw=2.0,
+                        mutation_scale=12,
+                        connectionstyle='arc3,rad=0.1',
+                    ),
+                    zorder=12,
+                )
+
+    ax.legend(handles=_role_legend_handles(), loc='upper right',
               framealpha=0.85, fontsize=9)
     ax.set_title(title)
 
     beta_lines = _format_beta_steps(holds, sequence, dyn_tags)
     stats_lines = _build_stats_lines(holds, sequence, dyn_tags) if include_stats else []
-    _render_beta_panel(panel, beta_lines, stats_lines, active_idx=None)
+    _render_beta_panel(panel, beta_lines, stats_lines,
+                       active_idx=None, phase_colors=move_colors)
 
     plt.tight_layout()
 
@@ -1254,7 +1393,8 @@ def plot_hold_density(
     plt.close()
 
 
-def visualizeclimb(climb_data, climb_id, output_dir="climb_visualizations", viz_type="path", draw_body=True):
+def visualizeclimb(climb_data, climb_id, output_dir="climb_visualizations",
+                   viz_type="path", draw_body=True, keyframe=None):
     os.makedirs(output_dir, exist_ok=True)
 
     climb = None
@@ -1285,6 +1425,7 @@ def visualizeclimb(climb_data, climb_id, output_dir="climb_visualizations", viz_
                 title=f"{climb.get('name', 'Climb')} (ID: {climb_id})",
                 output_path=save_path,
                 draw_body=draw_body,
+                keyframe=keyframe,
             )
         elif viz_type == "cycle":
             # interactive cycle view (shows a GUI window)
@@ -1346,6 +1487,10 @@ def main():
         "--no-body", dest="draw_body", action="store_false",
         help="Disable the body overlay.",
     )
+    parser.add_argument(
+        "--keyframe", type=int, default=None,
+        help="Step index (0-based) to show body overlay on (default: auto crux).",
+    )
 
     args = parser.parse_args()
     
@@ -1357,7 +1502,8 @@ def main():
         return
     
     #save
-    visualizeclimb(data, args.id, args.output_dir, args.type, draw_body=args.draw_body)
+    visualizeclimb(data, args.id, args.output_dir, args.type,
+                   draw_body=args.draw_body, keyframe=args.keyframe)
 
 if __name__ == "__main__":
     main()

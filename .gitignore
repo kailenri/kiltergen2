@@ -100,3 +100,4 @@ data/
 *.jsonl
 *.json
 comparisons/
+CLAUDE.md

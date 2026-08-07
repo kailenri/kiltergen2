@@ -723,11 +723,31 @@ class ClimbSequenceGenerator:
                                             # Small reward for a balanced flag.
                                             move_score += 0.5
 
+                            # Classify transition type for this hand move.
+                            if next_hold['role_id'] == 14:
+                                _ttype = 'finish'
+                            elif cut_happened:
+                                _ttype = 'dyno'
+                            elif FLAG_ENABLED and not cut_happened and is_crossing_hand_move(
+                                    (next_hold['x'], next_hold['y']),
+                                    (state['limbs']['LH' if limb == 'RH' else 'RH']['x'],
+                                     state['limbs']['LH' if limb == 'RH' else 'RH']['y'])
+                                    if state['limbs'].get('LH' if limb == 'RH' else 'RH') else None,
+                                    limb):
+                                _ttype = 'cross'
+                            elif current and math.hypot(
+                                    next_hold['x'] - current['x'],
+                                    next_hold['y'] - current['y']) > MAX_HAND_REACH * 0.75:
+                                _ttype = 'lock_off'
+                            else:
+                                _ttype = 'hand_move'
+
                             new_states.append({
                                 'sequence': state['sequence'] + [{
                                     'limb': limb,
                                     'hold': next_id,
-                                    'position': next_hold.get('position')
+                                    'position': next_hold.get('position'),
+                                    'transition_type': _ttype,
                                 }],
                                 'limbs': new_limbs,
                                 'cut_feet': new_cut,
@@ -776,19 +796,158 @@ class ClimbSequenceGenerator:
                             move_score += 2.0
                         if was_flagging:
                             move_score += 1.0  # reward landing from a flag
+
+                        # Quality bias for feet: prefer large footholds (jugs/smears)
+                        # over crimps, mirroring the hand quality multiplier.
+                        q = get_hold_quality(next_id)
+                        move_score *= (0.7 + 0.6 * q)
+
+                        # Direction bias: if this foot's hold has an orientation,
+                        # reward steps where the hold edge faces away from the
+                        # climber's pull direction — the back-step / drop-knee
+                        # geometry that generates hip torque.
+                        dir_deg = get_hold_direction(next_id)
+                        if dir_deg is not None:
+                            foot_xys_post = [new_limbs[f]
+                                             for f in ('RF', 'LF')
+                                             if new_limbs.get(f) is not None]
+                            hip_post = _kin_estimate_hip([
+                                (h['x'], h['y']) for h in foot_xys_post
+                            ]) if foot_xys_post else None
+                            rh = state['limbs'].get('RH')
+                            lh = state['limbs'].get('LH')
+                            if hip_post and (rh or lh):
+                                avg_hand_x = ((rh['x'] if rh else 0) +
+                                              (lh['x'] if lh else 0)) / max(
+                                                  int(bool(rh)) + int(bool(lh)), 1)
+                                avg_hand_y = ((rh['y'] if rh else 0) +
+                                              (lh['y'] if lh else 0)) / max(
+                                                  int(bool(rh)) + int(bool(lh)), 1)
+                                pull_dx = avg_hand_x - hip_post[0]
+                                pull_dy = avg_hand_y - hip_post[1]
+                                pull_len = math.hypot(pull_dx, pull_dy)
+                                if pull_len > 0:
+                                    import math as _math
+                                    dir_rad = _math.radians(dir_deg)
+                                    edge_dx = _math.cos(dir_rad)
+                                    edge_dy = _math.sin(dir_rad)
+                                    # dot < 0 means edge faces away from pull → back-step
+                                    dot = (pull_dx * edge_dx + pull_dy * edge_dy) / pull_len
+                                    move_score += 0.5 * max(0.0, -dot)
+
+                        # Penalise high steps above the hip (hard on the body).
+                        foot_xys_cur = [state['limbs'][f]
+                                        for f in ('RF', 'LF')
+                                        if state['limbs'].get(f) is not None]
+                        hip_cur = _kin_estimate_hip([
+                            (h['x'], h['y']) for h in foot_xys_cur
+                        ]) if foot_xys_cur else None
+                        if hip_cur is not None:
+                            step_height = next_hold['y'] - hip_cur[1]
+                            if step_height > X_SPACING:
+                                move_score -= 0.4 * (step_height / X_SPACING - 1.0)
+
+                        # One-ply hand lookahead: reward foot placements that open
+                        # up better hand moves from the resulting body position.
+                        # Only applied to the top-K (5) foot candidates by base
+                        # score to keep beam cost reasonable.
+                        _LOOKAHEAD_WEIGHT = 0.5
+                        post_foot_xys = [new_limbs[f]
+                                         for f in ('RF', 'LF')
+                                         if new_limbs.get(f) is not None]
+                        post_hip = _kin_estimate_hip([
+                            (h['x'], h['y']) for h in post_foot_xys
+                        ]) if post_foot_xys else None
+                        if post_hip is not None:
+                            post_shoulder = _kin_estimate_shoulder(post_hip)
+                            rx_la = MAX_HAND_REACH * 0.9
+                            ry_la = MAX_HAND_REACH * 0.6 + (X_SPACING * 1.2)
+                            best_dnorm = 2.0  # cap; lower is better
+                            for _h in self.hand_holds:
+                                _dn = _kin_ellipse_dnorm(
+                                    (_h['x'], _h['y']), post_shoulder, rx_la, ry_la)
+                                if _dn < best_dnorm:
+                                    best_dnorm = _dn
+                            # best_dnorm near 0 = many easy reaches; near 1 = barely
+                            # reachable. Reward low dnorm (good position) with a bonus.
+                            lookahead_bonus = _LOOKAHEAD_WEIGHT * max(0.0, 1.0 - best_dnorm)
+                            move_score += lookahead_bonus
+
                         move_score *= foot_streak_boost
+
+                        # Classify foot transition type.
+                        other_foot = 'LF' if limb == 'RF' else 'RF'
+                        other_foot_hold = state['limbs'].get(other_foot)
+                        if was_flagging:
+                            _fttype = 'unflag'
+                        elif cut_feet and limb in cut_feet:
+                            _fttype = 'replant'
+                        elif (other_foot_hold is not None and
+                              next_id == other_foot_hold.get('hole_id')):
+                            _fttype = 'match'
+                        elif (other_foot_hold is not None and
+                              ((limb == 'RF' and next_hold['x'] < other_foot_hold['x'] - X_SPACING * 0.3) or
+                               (limb == 'LF' and next_hold['x'] > other_foot_hold['x'] + X_SPACING * 0.3))):
+                            _fttype = 'back_step'
+                        elif next_hold['y'] > (current['y'] if current else 0) + X_SPACING * 1.5:
+                            _fttype = 'high_step'
+                        elif next_hold['y'] > (current['y'] if current else 0) + X_SPACING * 0.3:
+                            _fttype = 'step_up'
+                        else:
+                            _fttype = 'foot_move'
 
                         new_states.append({
                             'sequence': state['sequence'] + [{
                                 'limb': limb,
                                 'hold': next_id,
-                                'position': next_hold.get('position')
+                                'position': next_hold.get('position'),
+                                'transition_type': _fttype,
                             }],
                             'limbs': new_limbs,
                             'cut_feet': new_cut,
                             'flags': new_flags,
                             'score': state['score'] + move_score
                         })
+
+            # Match transitions: allow RF or LF to move onto the other foot's current
+            # hold when that hold is large enough (quality >= 0.75). Both feet land
+            # on the same hold — a common micro-move on Kilter.
+            for limb in ['RF', 'LF']:
+                if cut_feet and FOOT_CUT_ENABLED and limb not in cut_feet:
+                    continue
+                other_foot = 'LF' if limb == 'RF' else 'RF'
+                other_hold = state['limbs'].get(other_foot)
+                if other_hold is None:
+                    continue
+                match_id = other_hold['hole_id']
+                current = state['limbs'].get(limb)
+                current_id = current['hole_id'] if current else -1
+                if current_id == match_id:
+                    continue  # already matched
+                if get_hold_quality(match_id) < 0.75:
+                    continue  # too small for both feet
+                if not self.is_valid_foot_transition(
+                        current_id, match_id, limb, current_limbs_tuple):
+                    continue
+                new_limbs = {k: v for k, v in state['limbs'].items()}
+                new_limbs[limb] = other_hold
+                new_cut = cut_feet - {limb} if cut_feet else cut_feet
+                new_flags = dict(flags)
+                new_flags[limb] = None
+                match_q = get_hold_quality(match_id)
+                match_score = 2.0 * match_q * foot_streak_boost
+                new_states.append({
+                    'sequence': state['sequence'] + [{
+                        'limb': limb,
+                        'hold': match_id,
+                        'position': other_hold.get('position'),
+                        'transition_type': 'match',
+                    }],
+                    'limbs': new_limbs,
+                    'cut_feet': new_cut,
+                    'flags': new_flags,
+                    'score': state['score'] + match_score
+                })
 
         return new_states
 
@@ -842,16 +1001,18 @@ class ClimbSequenceGenerator:
             # sequence begins on the start holds (and start feet, if any).
             seq = [
                 {'limb': 'RH', 'hold': rh_hold['hole_id'],
-                 'position': rh_hold.get('position')},
+                 'position': rh_hold.get('position'), 'transition_type': 'start_hand'},
                 {'limb': 'LH', 'hold': lh_hold['hole_id'],
-                 'position': lh_hold.get('position')},
+                 'position': lh_hold.get('position'), 'transition_type': 'start_hand'},
             ]
             if rf_hold is not None:
                 seq.append({'limb': 'RF', 'hold': rf_hold['hole_id'],
-                            'position': rf_hold.get('position')})
+                            'position': rf_hold.get('position'),
+                            'transition_type': 'start_foot'})
             if lf_hold is not None:
                 seq.append({'limb': 'LF', 'hold': lf_hold['hole_id'],
-                            'position': lf_hold.get('position')})
+                            'position': lf_hold.get('position'),
+                            'transition_type': 'start_foot'})
             return seq
 
         #just hands on start holds

@@ -1,4 +1,11 @@
-DB_PATH = "DB-path-here" #enter your local path to the DB
+import os as _os
+# Default to the DB that ships at the repo root, resolved relative to this
+# file so it works regardless of the caller's working directory. Override by
+# setting the env var or editing this path if your DB lives elsewhere.
+DB_PATH = _os.environ.get(
+    "KILTERGEN_DB_PATH",
+    _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "db.sqlite3"),
+)
 BEAM_WIDTH = 100 #beam search width 
 X_SPACING = 18.66666666666 #spacing of holds from eachother on X axis 8 inches = 18.666666 X
 Y_SPACING = 19.83333333333 #spacing on Y axis 8.5 inches 
